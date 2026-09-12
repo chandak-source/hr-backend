@@ -1,0 +1,46 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# New > Blueprint > pick this repo. Values marked `sync: false` are filled in
+# the Render dashboard (they come from your Aiven MySQL service page).
+services:
+  - type: web
+    name: hr-backend
+    runtime: node
+    plan: free
+    region: singapore
+    branch: main
+    buildCommand: npm ci
+    startCommand: npm start
+    # Liveness, not readiness — /health returns 503 when MySQL is down, which
+    # would make Render restart the service in a loop.
+    healthCheckPath: /health/live
+    autoDeploy: true
+    envVars:
+      # Render injects PORT itself — don't set it here.
+      - key: NODE_ENV
+        value: production
+      - key: API_PREFIX
+        value: /api/v1
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRES_IN
+        value: 1d
+      - key: REFRESH_TOKEN_EXPIRES_IN_DAYS
+        value: "30"
+      - key: DB_CONNECTION_LIMIT
+        # Aiven's free plan caps total connections low; keep the pool small.
+        value: "5"
+      - key: DB_SSL
+        value: "true"
+      # ---- from the Aiven service page ----
+      - key: DB_HOST
+        sync: false
+      - key: DB_PORT
+        sync: false
+      - key: DB_USER
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
+      - key: DB_NAME
+        sync: false
+      - key: DB_SSL_CA
+        sync: false

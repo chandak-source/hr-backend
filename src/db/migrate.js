@@ -15,6 +15,7 @@ async function migrate() {
     port: env.db.port,
     user: env.db.user,
     password: env.db.password,
+    ssl: env.db.ssl,
     multipleStatements: true,
   });
 

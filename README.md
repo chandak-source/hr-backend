@@ -33,6 +33,8 @@ Seeded accounts all use the password from `SEED_PASSWORD` (default `demo@1234`).
 | `API_PREFIX` | `/api/v1` | |
 | `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME` | — | MySQL 8 |
 | `DB_CONNECTION_LIMIT` | `10` | Pool size |
+| `DB_SSL` | `false` | `true` for managed MySQL (Aiven, PlanetScale, RDS) |
+| `DB_SSL_CA` | — | Provider CA cert as PEM. Omitted ⇒ encrypted but unverified |
 | `JWT_SECRET` | — | **Required.** Long random string |
 | `JWT_EXPIRES_IN` | `1d` | Access token TTL |
 | `REFRESH_TOKEN_EXPIRES_IN_DAYS` | `30` | |
@@ -53,7 +55,7 @@ except `/auth/login`, `/auth/refresh` and `/health`.
 | `/approvals` | `GET /summary` · `GET,POST /leave` · `POST /leave/bulk-approve` · `GET,POST /expenses` · `GET,POST /regularizations` |
 | `/admin` | `GET /overview` · `GET,POST /employees` · `PATCH /employees/:id` · `GET /payroll/runs` · `POST /payroll/run` · `POST /payroll/runs/:id/publish` · `POST /payroll/runs/:id/unlock` · `POST,DELETE /announcements` · `GET /reports/{attendance,leave-balances,payroll-trend}` |
 | root | `GET /expenses` · `POST /expenses` · `GET /expenses/categories` · `GET /tasks` · `PATCH /tasks/:id` · `GET /holidays` · `GET /announcements` · `GET /notifications` · `PATCH /notifications/:id/read` · `POST /notifications/read-all` · `GET /directory` · `GET /departments` |
-| — | `GET /health` (outside the prefix) |
+| — | `GET /health` readiness (503 if MySQL down) · `GET /health/live` liveness — both outside the prefix |
 
 Role guards live in `src/middleware/auth.js`: `/approvals` needs manager, `/admin`
 needs admin, admin passes every guard.
@@ -72,11 +74,60 @@ src/
 └─ utils/             ApiError, asyncHandler, response helpers
 ```
 
-## Deploy
+## Deploy — Render + Aiven MySQL
 
-Any Node host works — set the env vars above, run `npm ci && npm start`.
-`src/server.js` binds the port before pinging MySQL so platform health checks
-pass during a cold start, and handles `SIGTERM` for zero-downtime restarts.
+`render.yaml` is a Render Blueprint; Aiven supplies the MySQL 8 that Render
+doesn't offer. The app is MySQL-specific (`ENUM`, `ON UPDATE CURRENT_TIMESTAMP`),
+so Render's own Postgres is not a drop-in swap.
+
+**1 — Aiven MySQL**
+
+Create a free *MySQL* service (Aiven console → Services → MySQL → free plan).
+From the service *Overview* tab collect: Host, Port, User (`avnadmin`),
+Password, and download **CA Certificate** (`ca.pem`).
+
+**2 — Create the database and load it (run locally)**
+
+Aiven's free plan has no shell, so point your local `.env` at Aiven and run the
+scripts from your machine:
+
+```env
+DB_HOST=mysql-xxxx.aivencloud.com
+DB_PORT=12345
+DB_USER=avnadmin
+DB_PASSWORD=<aiven password>
+DB_NAME=chanda_hr        # not defaultdb — migrate creates this one
+DB_SSL=true
+DB_SSL_CA="-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----"
+```
+
+```bash
+npm run db:migrate      # creates chanda_hr + 20 tables
+npm run db:seed         # demo employees, attendance, leave, payroll
+```
+
+Don't use `db:reset` / `--fresh` against Aiven unless you mean it — it drops the
+database first.
+
+**3 — Render**
+
+New → **Blueprint** → pick this repo. Render reads `render.yaml` and prompts for
+the six `sync: false` vars — paste the same Aiven values (`DB_SSL_CA` as the full
+PEM, newlines and all). `JWT_SECRET` is generated automatically; **don't** reuse
+your local one.
+
+Health check is `/health/live` (liveness). Hit `/health` yourself to confirm the
+database leg: it returns `{"status":"ok","database":"up"}` when Aiven is wired up.
+
+**Free-tier caveats**
+
+- Render free spins down after ~15 min idle — first request then takes ~50s.
+- Aiven free caps connections; `DB_CONNECTION_LIMIT` is set to `5` in the blueprint.
+- Both free tiers are fine for demos, not for production payroll data.
+
+Any other Node host works too — set the env vars above and run `npm ci && npm start`.
+`src/server.js` binds the port before pinging MySQL so health checks pass during a
+cold start, and handles `SIGTERM` for clean restarts.
 
 ## Not built yet
 

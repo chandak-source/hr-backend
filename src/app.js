@@ -30,6 +30,11 @@ export function createApp() {
     rateLimit({ windowMs: 15 * 60 * 1000, limit: 50, standardHeaders: 'draft-8' }),
   );
 
+  // Liveness — is the process up? Never touches the database, so a platform
+  // health check won't restart the service over a transient MySQL blip.
+  app.get('/health/live', (_req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
+
+  // Readiness — can we actually serve data?
   app.get('/health', async (_req, res) => {
     try {
       await pingDatabase();
