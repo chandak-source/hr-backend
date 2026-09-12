@@ -1,28 +1,61 @@
 import { Router } from 'express';
+import mongoose from 'mongoose';
 import { z } from 'zod';
 
-import { query, queryOne } from '../config/db.js';
+import { Attendance, Employee } from '../models/index.js';
 import { authenticate, requireRole } from '../middleware/auth.js';
 import { ApiError } from '../utils/ApiError.js';
-import { asyncHandler, ok, parseWith, todayString } from '../utils/helpers.js';
+import { reportingScope } from '../services/employee.service.js';
+import {
+  asyncHandler,
+  daysAgoString,
+  monthFilter,
+  ok,
+  parseWith,
+  searchFilter,
+  todayString,
+} from '../utils/helpers.js';
 
 const router = Router();
 router.use(authenticate, requireRole('manager'));
 
 /** Admins see the whole org, managers only their direct reports. */
-const scopeClause = (user, alias = 'e') =>
-  user.role === 'admin'
-    ? { sql: `${alias}.status <> 'exited'`, params: [] }
-    : { sql: `${alias}.reporting_to = ? AND ${alias}.status <> 'exited'`, params: [user.id] };
+const scopeFilter = (user) => ({ ...reportingScope(user), status: { $ne: 'exited' } });
 
-const MEMBER_SELECT = `
-  e.id, e.emp_code AS empCode, e.name, e.designation, e.phone, e.email,
-  d.name AS department,
-  COALESCE(a.status, 'absent') AS todayStatus,
-  a.punch_in  AS inTime,
-  a.punch_out AS outTime,
-  a.work_mode AS workMode
-`;
+/** Attaches the employee's attendance row for `date`, or nothing. */
+const attendanceOn = (date) => [
+  {
+    $lookup: {
+      from: 'attendances',
+      let: { eid: '$_id' },
+      pipeline: [
+        { $match: { $expr: { $and: [{ $eq: ['$employeeId', '$$eid'] }, { $eq: ['$workDate', date] }] } } },
+        { $limit: 1 },
+      ],
+      as: 'att',
+    },
+  },
+  { $addFields: { att: { $first: '$att' } } },
+];
+
+const MEMBER_PROJECT = {
+  _id: 0,
+  id: { $toString: '$_id' },
+  empCode: 1,
+  name: 1,
+  designation: 1,
+  phone: 1,
+  email: 1,
+  department: { $ifNull: [{ $first: '$dept.name' }, null] },
+  todayStatus: { $ifNull: ['$att.status', 'absent'] },
+  inTime: { $ifNull: ['$att.punchIn', null] },
+  outTime: { $ifNull: ['$att.punchOut', null] },
+  workMode: { $ifNull: ['$att.workMode', null] },
+};
+
+const withDepartment = {
+  $lookup: { from: 'departments', localField: 'departmentId', foreignField: '_id', as: 'dept' },
+};
 
 // GET /team/members?q&status --------------------------------------------------
 router.get(
@@ -38,28 +71,19 @@ router.get(
     );
 
     const on = date ?? todayString();
-    const scope = scopeClause(req.user);
-    const where = [scope.sql];
-    const params = [on, ...scope.params];
+    const match = { ...scopeFilter(req.user) };
+    if (q) Object.assign(match, searchFilter(q, ['name', 'empCode']));
 
-    if (q) {
-      where.push('(e.name LIKE ? OR e.emp_code LIKE ?)');
-      params.push(`%${q}%`, `%${q}%`);
-    }
-    if (status && status !== 'all') {
-      where.push('COALESCE(a.status, \'absent\') = ?');
-      params.push(status);
-    }
+    const rows = await Employee.aggregate([
+      { $match: match },
+      withDepartment,
+      ...attendanceOn(on),
+      { $project: MEMBER_PROJECT },
+      // Filtering on todayStatus has to happen after the projection computes it.
+      ...(status && status !== 'all' ? [{ $match: { todayStatus: status } }] : []),
+      { $sort: { name: 1 } },
+    ]);
 
-    const rows = await query(
-      `SELECT ${MEMBER_SELECT}
-         FROM employees e
-         LEFT JOIN departments d ON d.id = e.department_id
-         LEFT JOIN attendance  a ON a.employee_id = e.id AND a.work_date = ?
-        WHERE ${where.join(' AND ')}
-        ORDER BY e.name`,
-      params,
-    );
     ok(res, rows, { date: on, count: rows.length });
   }),
 );
@@ -69,33 +93,26 @@ router.get(
   '/stats',
   asyncHandler(async (req, res) => {
     const on = req.query.date ?? todayString();
-    const scope = scopeClause(req.user);
 
-    const row = await queryOne(
-      `SELECT
-         COUNT(*) AS teamSize,
-         SUM(COALESCE(a.status,'absent') IN ('present','late_in','half_day')) AS present,
-         SUM(COALESCE(a.status,'absent') = 'late_in')  AS lateIn,
-         SUM(COALESCE(a.status,'absent') = 'leave')    AS onLeave,
-         SUM(COALESCE(a.status,'absent') = 'absent')   AS absent,
-         SUM(COALESCE(a.status,'absent') = 'week_off') AS weekOff
-       FROM employees e
-       LEFT JOIN attendance a ON a.employee_id = e.id AND a.work_date = ?
-      WHERE ${scope.sql}`,
-      [on, ...scope.params],
-    );
+    const rows = await Employee.aggregate([
+      { $match: scopeFilter(req.user) },
+      ...attendanceOn(on),
+      { $addFields: { todayStatus: { $ifNull: ['$att.status', 'absent'] } } },
+      { $group: { _id: '$todayStatus', total: { $sum: 1 } } },
+    ]);
 
-    const size = Number(row.teamSize) || 0;
-    const present = Number(row.present) || 0;
+    const by = Object.fromEntries(rows.map((r) => [r._id, r.total]));
+    const size = rows.reduce((s, r) => s + r.total, 0);
+    const present = (by.present ?? 0) + (by.late_in ?? 0) + (by.half_day ?? 0);
 
     ok(res, {
       date: on,
       teamSize: size,
       present,
-      lateIn: Number(row.lateIn) || 0,
-      onLeave: Number(row.onLeave) || 0,
-      absent: Number(row.absent) || 0,
-      weekOff: Number(row.weekOff) || 0,
+      lateIn: by.late_in ?? 0,
+      onLeave: by.leave ?? 0,
+      absent: by.absent ?? 0,
+      weekOff: by.week_off ?? 0,
       attendancePercent: size ? Math.round((present / size) * 100) : 0,
     });
   }),
@@ -109,19 +126,37 @@ router.get(
       z.object({ days: z.coerce.number().int().min(3).max(31).default(7) }),
       req.query,
     );
-    const scope = scopeClause(req.user);
 
-    const rows = await query(
-      `SELECT a.work_date AS date,
-              ROUND(100 * SUM(a.status IN ('present','late_in','half_day')) / NULLIF(COUNT(*), 0)) AS percent
-         FROM attendance a
-         JOIN employees e ON e.id = a.employee_id
-        WHERE ${scope.sql}
-          AND a.work_date >= DATE_SUB(CURDATE(), INTERVAL ${days} DAY)
-        GROUP BY a.work_date
-        ORDER BY a.work_date`,
-      scope.params,
-    );
+    const scoped = await Employee.find(scopeFilter(req.user)).select('_id').lean();
+    const ids = scoped.map((e) => e._id);
+
+    const rows = await Attendance.aggregate([
+      { $match: { employeeId: { $in: ids }, workDate: { $gte: daysAgoString(days) } } },
+      {
+        $group: {
+          _id: '$workDate',
+          total: { $sum: 1 },
+          present: {
+            $sum: { $cond: [{ $in: ['$status', ['present', 'late_in', 'half_day']] }, 1, 0] },
+          },
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          date: '$_id',
+          percent: {
+            $cond: [
+              { $gt: ['$total', 0] },
+              { $round: [{ $multiply: [100, { $divide: ['$present', '$total'] }] }, 0] },
+              null,
+            ],
+          },
+        },
+      },
+      { $sort: { date: 1 } },
+    ]);
+
     ok(res, rows);
   }),
 );
@@ -130,28 +165,43 @@ router.get(
 router.get(
   '/members/:id',
   asyncHandler(async (req, res) => {
-    const scope = scopeClause(req.user);
-    const member = await queryOne(
-      `SELECT ${MEMBER_SELECT}, e.date_of_joining AS dateOfJoining
-         FROM employees e
-         LEFT JOIN departments d ON d.id = e.department_id
-         LEFT JOIN attendance  a ON a.employee_id = e.id AND a.work_date = ?
-        WHERE e.id = ? AND ${scope.sql}`,
-      [todayString(), req.params.id, ...scope.params],
-    );
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      throw ApiError.notFound('Team member not found in your reporting line');
+    }
+    const memberId = new mongoose.Types.ObjectId(String(req.params.id));
+
+    const [member] = await Employee.aggregate([
+      { $match: { _id: memberId, ...scopeFilter(req.user) } },
+      withDepartment,
+      ...attendanceOn(todayString()),
+      { $project: { ...MEMBER_PROJECT, dateOfJoining: 1 } },
+    ]);
     if (!member) throw ApiError.notFound('Team member not found in your reporting line');
 
-    const mtd = await queryOne(
-      `SELECT SUM(status IN ('present','late_in')) AS present,
-              SUM(status = 'leave')   AS leaves,
-              SUM(status = 'late_in') AS lateMarks,
-              SUM(status IN ('absent','miss_punch')) AS absents
-         FROM attendance
-        WHERE employee_id = ? AND MONTH(work_date) = MONTH(CURDATE()) AND YEAR(work_date) = YEAR(CURDATE())`,
-      [req.params.id],
-    );
+    const now = new Date();
+    const [mtd] = await Attendance.aggregate([
+      {
+        $match: {
+          employeeId: memberId,
+          workDate: monthFilter(now.getMonth() + 1, now.getFullYear()),
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          present: { $sum: { $cond: [{ $in: ['$status', ['present', 'late_in']] }, 1, 0] } },
+          leaves: { $sum: { $cond: [{ $eq: ['$status', 'leave'] }, 1, 0] } },
+          lateMarks: { $sum: { $cond: [{ $eq: ['$status', 'late_in'] }, 1, 0] } },
+          absents: { $sum: { $cond: [{ $in: ['$status', ['absent', 'miss_punch']] }, 1, 0] } },
+        },
+      },
+      { $project: { _id: 0 } },
+    ]);
 
-    ok(res, { ...member, monthToDate: mtd });
+    ok(res, {
+      ...member,
+      monthToDate: mtd ?? { present: 0, leaves: 0, lateMarks: 0, absents: 0 },
+    });
   }),
 );
 

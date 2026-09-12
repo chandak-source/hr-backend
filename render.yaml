@@ -1,6 +1,6 @@
 # Render Blueprint — https://render.com/docs/blueprint-spec
-# New > Blueprint > pick this repo. Values marked `sync: false` are filled in
-# the Render dashboard (they come from your Aiven MySQL service page).
+# New > Blueprint > pick this repo. `sync: false` values are filled in the
+# Render dashboard; MONGODB_URI comes from MongoDB Atlas.
 services:
   - type: web
     name: hr-backend
@@ -10,7 +10,7 @@ services:
     branch: main
     buildCommand: npm ci
     startCommand: npm start
-    # Liveness, not readiness — /health returns 503 when MySQL is down, which
+    # Liveness, not readiness — /health returns 503 when MongoDB is down, which
     # would make Render restart the service in a loop.
     healthCheckPath: /health/live
     autoDeploy: true
@@ -26,21 +26,13 @@ services:
         value: 1d
       - key: REFRESH_TOKEN_EXPIRES_IN_DAYS
         value: "30"
-      - key: DB_CONNECTION_LIMIT
-        # Aiven's free plan caps total connections low; keep the pool small.
-        value: "5"
-      - key: DB_SSL
-        value: "true"
-      # ---- from the Aiven service page ----
-      - key: DB_HOST
+      # Atlas SRV resolves normally on Render; the local DNS workaround is
+      # deliberately left unset here.
+      - key: DNS_SERVERS
+        value: ""
+      # Atlas connection string, including the database name in the path.
+      - key: MONGODB_URI
         sync: false
-      - key: DB_PORT
-        sync: false
-      - key: DB_USER
-        sync: false
-      - key: DB_PASSWORD
-        sync: false
-      - key: DB_NAME
-        sync: false
-      - key: DB_SSL_CA
+      # Only needed if the database should differ from the URI path.
+      - key: MONGODB_DB
         sync: false

@@ -1,19 +1,41 @@
 import { Router } from 'express';
+import mongoose from 'mongoose';
 import { z } from 'zod';
 
-import { query, queryOne, transaction } from '../config/db.js';
+import { withTransaction } from '../config/db.js';
+import {
+  Attendance,
+  AuditLog,
+  Employee,
+  ExpenseClaim,
+  LeaveBalance,
+  LeaveRequest,
+  Notification,
+  RegularizationRequest,
+} from '../models/index.js';
 import { authenticate, requireRole } from '../middleware/auth.js';
 import { ApiError } from '../utils/ApiError.js';
-import { asyncHandler, financialYearOf, ok, parseWith } from '../utils/helpers.js';
+import { asyncHandler, eachDate, financialYearOf, ok, parseWith } from '../utils/helpers.js';
 
 const router = Router();
 router.use(authenticate, requireRole('manager'));
 
-/** Admins approve for everyone; managers only for their own reports. */
-const approverScope = (user, alias) =>
-  user.role === 'admin'
-    ? { sql: '1 = 1', params: [] }
-    : { sql: `${alias}.reporting_to = ?`, params: [user.id] };
+/**
+ * Admins approve for everyone; managers only for their own reports.
+ * Returns `null` for "no restriction", otherwise the employee ids in scope.
+ */
+async function scopedEmployeeIds(user) {
+  if (user.role === 'admin') return null;
+  const rows = await Employee.find({ reportingTo: user._id }).select('_id').lean();
+  return rows.map((r) => r._id);
+}
+
+const scopeMatch = (ids) => (ids === null ? {} : { employeeId: { $in: ids } });
+
+/** Pending first, then newest — the SQL `FIELD(status,'pending') DESC` ordering. */
+const pendingFirst = (a, b) =>
+  (a.status === 'pending' ? 0 : 1) - (b.status === 'pending' ? 0 : 1) ||
+  new Date(b.createdAt) - new Date(a.createdAt);
 
 const actionSchema = z.object({
   action: z.enum(['approve', 'reject']),
@@ -28,50 +50,59 @@ const statusFilter = z.object({
 router.get(
   '/summary',
   asyncHandler(async (req, res) => {
-    const scope = approverScope(req.user, 'e');
-    const counts = await queryOne(
-      `SELECT
-        (SELECT COUNT(*) FROM leave_requests r JOIN employees e ON e.id = r.employee_id
-          WHERE r.status = 'pending' AND ${scope.sql}) AS leaves,
-        (SELECT COUNT(*) FROM expense_claims r JOIN employees e ON e.id = r.employee_id
-          WHERE r.status = 'pending' AND ${scope.sql}) AS expenses,
-        (SELECT COUNT(*) FROM regularization_requests r JOIN employees e ON e.id = r.employee_id
-          WHERE r.status = 'pending' AND ${scope.sql}) AS regularizations`,
-      [...scope.params, ...scope.params, ...scope.params],
-    );
-    const total = Number(counts.leaves) + Number(counts.expenses) + Number(counts.regularizations);
-    ok(res, { ...counts, total });
+    const ids = await scopedEmployeeIds(req.user);
+    const base = { status: 'pending', ...scopeMatch(ids) };
+
+    const [leaves, expenses, regularizations] = await Promise.all([
+      LeaveRequest.countDocuments(base),
+      ExpenseClaim.countDocuments(base),
+      RegularizationRequest.countDocuments(base),
+    ]);
+
+    ok(res, {
+      leaves,
+      expenses,
+      regularizations,
+      total: leaves + expenses + regularizations,
+    });
   }),
 );
 
 // ------------------------------------------------------------------ leave --
-const LEAVE_SELECT = `
-  lr.id, lr.request_code AS code, lr.from_date AS fromDate, lr.to_date AS toDate,
-  lr.day_type AS dayType, lr.days, lr.reason, lr.status, lr.applied_on AS appliedOn,
-  lr.action_on AS actionOn, lr.action_remark AS actionRemark,
-  lt.name AS leaveType, lt.code AS leaveTypeCode, lt.color_hex AS color,
-  e.id AS employeeId, e.name AS employeeName, e.emp_code AS employeeCode, e.designation
-`;
+const toApprovalLeave = (r) => ({
+  id: r._id.toString(),
+  code: r.requestCode,
+  fromDate: r.fromDate,
+  toDate: r.toDate,
+  dayType: r.dayType,
+  days: r.days,
+  reason: r.reason,
+  status: r.status,
+  appliedOn: r.appliedOn,
+  actionOn: r.actionOn,
+  actionRemark: r.actionRemark,
+  leaveType: r.leaveTypeId?.name ?? null,
+  leaveTypeCode: r.leaveTypeId?.code ?? null,
+  color: r.leaveTypeId?.color ?? null,
+  employeeId: r.employeeId?._id?.toString() ?? null,
+  employeeName: r.employeeId?.name ?? null,
+  employeeCode: r.employeeId?.empCode ?? null,
+  designation: r.employeeId?.designation ?? null,
+});
 
 router.get(
   '/leave',
   asyncHandler(async (req, res) => {
     const { status } = parseWith(statusFilter, req.query);
-    const scope = approverScope(req.user, 'e');
-    const where = [scope.sql];
-    const params = [...scope.params];
-    if (status !== 'all') { where.push('lr.status = ?'); params.push(status); }
+    const ids = await scopedEmployeeIds(req.user);
 
-    const rows = await query(
-      `SELECT ${LEAVE_SELECT}
-         FROM leave_requests lr
-         JOIN employees e ON e.id = lr.employee_id
-         JOIN leave_types lt ON lt.id = lr.leave_type_id
-        WHERE ${where.join(' AND ')}
-        ORDER BY FIELD(lr.status, 'pending') DESC, lr.created_at DESC`,
-      params,
-    );
-    ok(res, rows, { count: rows.length });
+    const filter = { ...scopeMatch(ids), ...(status !== 'all' ? { status } : {}) };
+    const rows = await LeaveRequest.find(filter)
+      .populate('leaveTypeId', 'name code color')
+      .populate('employeeId', 'name empCode designation')
+      .lean();
+
+    ok(res, rows.sort(pendingFirst).map(toApprovalLeave), { count: rows.length });
   }),
 );
 
@@ -79,17 +110,15 @@ router.get(
 router.post(
   '/leave/bulk-approve',
   asyncHandler(async (req, res) => {
-    const scope = approverScope(req.user, 'e');
-    const pending = await query(
-      `SELECT lr.id FROM leave_requests lr JOIN employees e ON e.id = lr.employee_id
-        WHERE lr.status = 'pending' AND ${scope.sql}`,
-      scope.params,
-    );
+    const ids = await scopedEmployeeIds(req.user);
+    const pending = await LeaveRequest.find({ status: 'pending', ...scopeMatch(ids) })
+      .select('_id')
+      .lean();
 
     for (const row of pending) {
       // Sequential on purpose: each approval mutates balances and attendance.
       // eslint-disable-next-line no-await-in-loop
-      await applyLeaveDecision(req.user, row.id, true, 'Bulk approved');
+      await applyLeaveDecision(req.user, row._id, true, 'Bulk approved');
     }
     ok(res, { approved: pending.length });
   }),
@@ -99,26 +128,23 @@ router.post(
   '/leave/:id',
   asyncHandler(async (req, res) => {
     const { action, remark } = parseWith(actionSchema, req.body);
-    const scope = approverScope(req.user, 'e');
-
-    const request = await queryOne(
-      `SELECT lr.*, e.name AS employeeName, lt.name AS leaveTypeName, lt.annual_quota AS quota
-         FROM leave_requests lr
-         JOIN employees e ON e.id = lr.employee_id
-         JOIN leave_types lt ON lt.id = lr.leave_type_id
-        WHERE lr.id = ? AND ${scope.sql}`,
-      [req.params.id, ...scope.params],
-    );
-    if (!request) throw ApiError.notFound('Request not found in your approval queue');
-    if (request.status !== 'pending') {
-      throw ApiError.conflict(`Request is already ${request.status}`);
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      throw ApiError.notFound('Request not found in your approval queue');
     }
+    const ids = await scopedEmployeeIds(req.user);
 
-    await applyLeaveDecision(req.user, request.id, action === 'approve', remark);
+    const request = await LeaveRequest.findOne({
+      _id: req.params.id,
+      ...scopeMatch(ids),
+    }).lean();
+    if (!request) throw ApiError.notFound('Request not found in your approval queue');
+    if (request.status !== 'pending') throw ApiError.conflict(`Request is already ${request.status}`);
+
+    await applyLeaveDecision(req.user, request._id, action === 'approve', remark);
 
     ok(res, {
-      id: request.id,
-      code: request.request_code,
+      id: request._id.toString(),
+      code: request.requestCode,
       status: action === 'approve' ? 'approved' : 'rejected',
     });
   }),
@@ -129,81 +155,83 @@ router.post(
  * balance, blocks the attendance calendar and notifies the employee.
  */
 async function applyLeaveDecision(actor, id, approved, remark) {
-  const request = await queryOne(
-    `SELECT lr.*, lt.annual_quota AS quota, lt.name AS leaveTypeName
-       FROM leave_requests lr JOIN leave_types lt ON lt.id = lr.leave_type_id
-      WHERE lr.id = ?`,
-    [id],
-  );
+  const request = await LeaveRequest.findById(id).populate('leaveTypeId', 'name annualQuota').lean();
   if (!request || request.status !== 'pending') return;
 
-  await transaction(async (conn) => {
-    await conn.execute(
-      `UPDATE leave_requests
-          SET status = ?, approver_id = ?, action_on = NOW(), action_remark = ?
-        WHERE id = ?`,
-      [approved ? 'approved' : 'rejected', actor.id, remark ?? null, request.id],
+  const leaveType = request.leaveTypeId;
+
+  await withTransaction(async (session) => {
+    await LeaveRequest.updateOne(
+      { _id: request._id },
+      {
+        $set: {
+          status: approved ? 'approved' : 'rejected',
+          approverId: actor._id,
+          actionOn: new Date(),
+          actionRemark: remark ?? null,
+        },
+      },
+      { session },
     );
 
     if (approved) {
-      if (Number(request.quota) > 0) {
-        await conn.execute(
-          `UPDATE leave_balances SET used = used + ?
-            WHERE employee_id = ? AND leave_type_id = ? AND financial_year = ?`,
-          [request.days, request.employee_id, request.leave_type_id, financialYearOf(request.from_date)],
+      if (Number(leaveType?.annualQuota) > 0) {
+        await LeaveBalance.updateOne(
+          {
+            employeeId: request.employeeId,
+            leaveTypeId: request.leaveTypeId._id,
+            financialYear: financialYearOf(request.fromDate),
+          },
+          { $inc: { used: request.days } },
+          { session },
         );
       }
 
       // Block out every date in the range so payroll reads leave, not absent.
-      const rows = eachDate(request.from_date, request.to_date).map((date) => [
-        request.employee_id,
-        date,
-      ]);
-      if (rows.length) {
-        await conn.query(
-          `INSERT INTO attendance (employee_id, work_date, status)
-           VALUES ${rows.map(() => "(?, ?, 'leave')").join(', ')}
-           ON DUPLICATE KEY UPDATE
-             status = 'leave', punch_in = NULL, punch_out = NULL, total_minutes = 0`,
-          rows.flat(),
+      const dates = eachDate(request.fromDate, request.toDate);
+      if (dates.length) {
+        await Attendance.bulkWrite(
+          dates.map((workDate) => ({
+            updateOne: {
+              filter: { employeeId: request.employeeId, workDate },
+              update: {
+                $set: { status: 'leave', punchIn: null, punchOut: null, totalMinutes: 0 },
+              },
+              upsert: true,
+            },
+          })),
+          { session },
         );
       }
     }
 
-    await conn.execute(
-      `INSERT INTO notifications (employee_id, title, subtitle, kind) VALUES (?,?,?,'leave')`,
+    await Notification.create(
       [
-        request.employee_id,
-        approved ? 'Leave approved' : 'Leave rejected',
-        `${request.leaveTypeName} (${request.request_code}) was ${approved ? 'approved' : 'rejected'} by ${actor.name}.`,
+        {
+          employeeId: request.employeeId,
+          title: approved ? 'Leave approved' : 'Leave rejected',
+          subtitle: `${leaveType?.name ?? 'Leave'} (${request.requestCode}) was ${
+            approved ? 'approved' : 'rejected'
+          } by ${actor.name}.`,
+          kind: 'leave',
+        },
       ],
+      { session },
     );
 
-    await conn.execute(
-      `INSERT INTO audit_logs (actor_id, action, entity, entity_id, meta)
-       VALUES (?,?,'leave_request',?,?)`,
+    await AuditLog.create(
       [
-        actor.id,
-        approved ? 'approve' : 'reject',
-        String(request.id),
-        JSON.stringify({ remark: remark ?? null }),
+        {
+          actorId: actor._id,
+          action: approved ? 'approve' : 'reject',
+          entity: 'leave_request',
+          entityId: request._id.toString(),
+          meta: { remark: remark ?? null },
+        },
       ],
+      { session },
     );
   });
-}
-
-/** Inclusive list of YYYY-MM-DD strings between two dates. */
-function eachDate(from, to) {
-  const dates = [];
-  const cursor = new Date(`${from}T00:00:00`);
-  const end = new Date(`${to}T00:00:00`);
-  const fmt = (d) =>
-    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-  while (cursor <= end && dates.length < 366) {
-    dates.push(fmt(cursor));
-    cursor.setDate(cursor.getDate() + 1);
-  }
-  return dates;
 }
 
 // --------------------------------------------------------------- expenses --
@@ -211,23 +239,32 @@ router.get(
   '/expenses',
   asyncHandler(async (req, res) => {
     const { status } = parseWith(statusFilter, req.query);
-    const scope = approverScope(req.user, 'e');
-    const where = [scope.sql];
-    const params = [...scope.params];
-    if (status !== 'all') { where.push('ec.status = ?'); params.push(status); }
+    const ids = await scopedEmployeeIds(req.user);
 
-    const rows = await query(
-      `SELECT ec.id, ec.claim_code AS code, ec.amount, ec.expense_date AS expenseDate,
-              ec.note, ec.status, c.name AS category,
-              e.id AS employeeId, e.name AS employeeName, e.emp_code AS employeeCode
-         FROM expense_claims ec
-         JOIN employees e ON e.id = ec.employee_id
-         JOIN expense_categories c ON c.id = ec.category_id
-        WHERE ${where.join(' AND ')}
-        ORDER BY FIELD(ec.status, 'pending') DESC, ec.created_at DESC`,
-      params,
+    const rows = await ExpenseClaim.find({
+      ...scopeMatch(ids),
+      ...(status !== 'all' ? { status } : {}),
+    })
+      .populate('categoryId', 'name')
+      .populate('employeeId', 'name empCode')
+      .lean();
+
+    ok(
+      res,
+      rows.sort(pendingFirst).map((c) => ({
+        id: c._id.toString(),
+        code: c.claimCode,
+        amount: c.amount,
+        expenseDate: c.expenseDate,
+        note: c.note,
+        status: c.status,
+        category: c.categoryId?.name ?? null,
+        employeeId: c.employeeId?._id?.toString() ?? null,
+        employeeName: c.employeeId?.name ?? null,
+        employeeCode: c.employeeId?.empCode ?? null,
+      })),
+      { count: rows.length },
     );
-    ok(res, rows, { count: rows.length });
   }),
 );
 
@@ -235,35 +272,49 @@ router.post(
   '/expenses/:id',
   asyncHandler(async (req, res) => {
     const { action, remark } = parseWith(actionSchema, req.body);
-    const scope = approverScope(req.user, 'e');
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      throw ApiError.notFound('Claim not found in your approval queue');
+    }
+    const ids = await scopedEmployeeIds(req.user);
 
-    const claim = await queryOne(
-      `SELECT ec.* FROM expense_claims ec JOIN employees e ON e.id = ec.employee_id
-        WHERE ec.id = ? AND ${scope.sql}`,
-      [req.params.id, ...scope.params],
-    );
+    const claim = await ExpenseClaim.findOne({ _id: req.params.id, ...scopeMatch(ids) }).lean();
     if (!claim) throw ApiError.notFound('Claim not found in your approval queue');
     if (claim.status !== 'pending') throw ApiError.conflict(`Claim is already ${claim.status}`);
 
     const approved = action === 'approve';
-    await transaction(async (conn) => {
-      await conn.execute(
-        `UPDATE expense_claims
-            SET status = ?, approver_id = ?, action_on = NOW(), action_remark = ?
-          WHERE id = ?`,
-        [approved ? 'approved' : 'rejected', req.user.id, remark ?? null, claim.id],
+    await withTransaction(async (session) => {
+      await ExpenseClaim.updateOne(
+        { _id: claim._id },
+        {
+          $set: {
+            status: approved ? 'approved' : 'rejected',
+            approverId: req.user._id,
+            actionOn: new Date(),
+            actionRemark: remark ?? null,
+          },
+        },
+        { session },
       );
-      await conn.execute(
-        `INSERT INTO notifications (employee_id, title, subtitle, kind) VALUES (?,?,?,'expense')`,
+      await Notification.create(
         [
-          claim.employee_id,
-          approved ? 'Expense approved' : 'Expense rejected',
-          `Claim ${claim.claim_code} for ₹${claim.amount} was ${approved ? 'approved' : 'rejected'}.`,
+          {
+            employeeId: claim.employeeId,
+            title: approved ? 'Expense approved' : 'Expense rejected',
+            subtitle: `Claim ${claim.claimCode} for ₹${claim.amount} was ${
+              approved ? 'approved' : 'rejected'
+            }.`,
+            kind: 'expense',
+          },
         ],
+        { session },
       );
     });
 
-    ok(res, { id: claim.id, code: claim.claim_code, status: approved ? 'approved' : 'rejected' });
+    ok(res, {
+      id: claim._id.toString(),
+      code: claim.claimCode,
+      status: approved ? 'approved' : 'rejected',
+    });
   }),
 );
 
@@ -272,22 +323,31 @@ router.get(
   '/regularizations',
   asyncHandler(async (req, res) => {
     const { status } = parseWith(statusFilter, req.query);
-    const scope = approverScope(req.user, 'e');
-    const where = [scope.sql];
-    const params = [...scope.params];
-    if (status !== 'all') { where.push('r.status = ?'); params.push(status); }
+    const ids = await scopedEmployeeIds(req.user);
 
-    const rows = await query(
-      `SELECT r.id, r.request_code AS code, r.work_date AS date, r.punch_in AS punchIn,
-              r.punch_out AS punchOut, r.reason, r.status,
-              e.id AS employeeId, e.name AS employeeName, e.emp_code AS employeeCode
-         FROM regularization_requests r
-         JOIN employees e ON e.id = r.employee_id
-        WHERE ${where.join(' AND ')}
-        ORDER BY FIELD(r.status, 'pending') DESC, r.created_at DESC`,
-      params,
+    const rows = await RegularizationRequest.find({
+      ...scopeMatch(ids),
+      ...(status !== 'all' ? { status } : {}),
+    })
+      .populate('employeeId', 'name empCode')
+      .lean();
+
+    ok(
+      res,
+      rows.sort(pendingFirst).map((r) => ({
+        id: r._id.toString(),
+        code: r.requestCode,
+        date: r.workDate,
+        punchIn: r.punchIn,
+        punchOut: r.punchOut,
+        reason: r.reason,
+        status: r.status,
+        employeeId: r.employeeId?._id?.toString() ?? null,
+        employeeName: r.employeeId?.name ?? null,
+        employeeCode: r.employeeId?.empCode ?? null,
+      })),
+      { count: rows.length },
     );
-    ok(res, rows, { count: rows.length });
   }),
 );
 
@@ -295,59 +355,77 @@ router.post(
   '/regularizations/:id',
   asyncHandler(async (req, res) => {
     const { action, remark } = parseWith(actionSchema, req.body);
-    const scope = approverScope(req.user, 'e');
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      throw ApiError.notFound('Request not found in your approval queue');
+    }
+    const ids = await scopedEmployeeIds(req.user);
 
-    const request = await queryOne(
-      `SELECT r.* FROM regularization_requests r JOIN employees e ON e.id = r.employee_id
-        WHERE r.id = ? AND ${scope.sql}`,
-      [req.params.id, ...scope.params],
-    );
+    const request = await RegularizationRequest.findOne({
+      _id: req.params.id,
+      ...scopeMatch(ids),
+    }).lean();
     if (!request) throw ApiError.notFound('Request not found in your approval queue');
     if (request.status !== 'pending') throw ApiError.conflict(`Request is already ${request.status}`);
 
     const approved = action === 'approve';
-    await transaction(async (conn) => {
-      await conn.execute(
-        `UPDATE regularization_requests
-            SET status = ?, approver_id = ?, action_on = NOW(), action_remark = ?
-          WHERE id = ?`,
-        [approved ? 'approved' : 'rejected', req.user.id, remark ?? null, request.id],
+    await withTransaction(async (session) => {
+      await RegularizationRequest.updateOne(
+        { _id: request._id },
+        {
+          $set: {
+            status: approved ? 'approved' : 'rejected',
+            approverId: req.user._id,
+            actionOn: new Date(),
+            actionRemark: remark ?? null,
+          },
+        },
+        { session },
       );
 
       if (approved) {
         const minutes =
-          Number(request.punch_out.slice(0, 2)) * 60 + Number(request.punch_out.slice(3, 5)) -
-          (Number(request.punch_in.slice(0, 2)) * 60 + Number(request.punch_in.slice(3, 5)));
+          Number(request.punchOut.slice(0, 2)) * 60 +
+          Number(request.punchOut.slice(3, 5)) -
+          (Number(request.punchIn.slice(0, 2)) * 60 + Number(request.punchIn.slice(3, 5)));
 
-        await conn.execute(
-          `INSERT INTO attendance
-             (employee_id, work_date, punch_in, punch_out, total_minutes, status, is_regularized, shift_id)
-           VALUES (?,?,?,?,?, 'present', 1, (SELECT shift_id FROM employees WHERE id = ?))
-           ON DUPLICATE KEY UPDATE
-             punch_in = VALUES(punch_in), punch_out = VALUES(punch_out),
-             total_minutes = VALUES(total_minutes), status = 'present', is_regularized = 1`,
-          [
-            request.employee_id,
-            request.work_date,
-            request.punch_in,
-            request.punch_out,
-            Math.max(0, minutes),
-            request.employee_id,
-          ],
+        const employee = await Employee.findById(request.employeeId).select('shiftId').lean();
+
+        await Attendance.updateOne(
+          { employeeId: request.employeeId, workDate: request.workDate },
+          {
+            $set: {
+              punchIn: request.punchIn,
+              punchOut: request.punchOut,
+              totalMinutes: Math.max(0, minutes),
+              status: 'present',
+              isRegularized: true,
+            },
+            $setOnInsert: { shiftId: employee?.shiftId ?? null },
+          },
+          { upsert: true, session },
         );
       }
 
-      await conn.execute(
-        `INSERT INTO notifications (employee_id, title, subtitle, kind) VALUES (?,?,?,'attendance')`,
+      await Notification.create(
         [
-          request.employee_id,
-          approved ? 'Regularization approved' : 'Regularization rejected',
-          `${request.request_code} for ${request.work_date} was ${approved ? 'approved' : 'rejected'}.`,
+          {
+            employeeId: request.employeeId,
+            title: approved ? 'Regularization approved' : 'Regularization rejected',
+            subtitle: `${request.requestCode} for ${request.workDate} was ${
+              approved ? 'approved' : 'rejected'
+            }.`,
+            kind: 'attendance',
+          },
         ],
+        { session },
       );
     });
 
-    ok(res, { id: request.id, code: request.request_code, status: approved ? 'approved' : 'rejected' });
+    ok(res, {
+      id: request._id.toString(),
+      code: request.requestCode,
+      status: approved ? 'approved' : 'rejected',
+    });
   }),
 );
 

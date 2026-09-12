@@ -1,18 +1,26 @@
 # hr-backend
 
 REST API for **Chanda HR** — the FactoHR-style employee self-service app.
-Node 20 + Express 5 + MySQL 8, JWT auth with refresh tokens, zod validation.
+Node 20 + Express 5 + **MongoDB** (Mongoose), JWT auth with refresh tokens,
+zod validation.
 
 ## Setup
 
 ```bash
 npm install
-cp .env.example .env        # fill in DB creds + a long random JWT_SECRET
-npm run db:reset            # create schema + seed demo data
+cp .env.example .env        # set MONGODB_URI + a long random JWT_SECRET
+npm run db:migrate          # build indexes
+npm run db:seed             # demo employees, attendance, leave, payroll
 npm run dev                 # http://localhost:4000/api/v1
 ```
 
-Seeded accounts all use the password from `SEED_PASSWORD` (default `demo@1234`).
+Seeded accounts all use the password from `SEED_PASSWORD` (default `demo@1234`):
+
+| Role | Email |
+|---|---|
+| Admin | `rupal.mehta@chandacorp.com` |
+| Manager | `nikhil.desai@chandacorp.com` |
+| Employee | `chandan.sharma@chandacorp.com` |
 
 ## Scripts
 
@@ -20,30 +28,44 @@ Seeded accounts all use the password from `SEED_PASSWORD` (default `demo@1234`).
 |---|---|
 | `npm start` | Run the API |
 | `npm run dev` | Run with `--watch` |
-| `npm run db:migrate` | Apply `src/db/schema.sql` (`--fresh` drops first) |
-| `npm run db:seed` | Load demo employees, attendance, leave, payroll |
+| `npm run db:migrate` | Create collections + build indexes (`--fresh` drops the database first) |
+| `npm run db:seed` | Load demo data (clears the collections it writes) |
 | `npm run db:reset` | `db:migrate --fresh` + `db:seed` |
+| `npm run smoke` | Read-only end-to-end check of every route group — safe to re-run |
+| `npm run verify:writes` | Exercises every mutating endpoint. **Not idempotent** — run `npm run db:seed` afterwards |
 
 ## Environment
 
 | Var | Default | Notes |
 |---|---|---|
-| `PORT` | `4000` | |
+| `PORT` | `4000` | Render injects its own |
 | `NODE_ENV` | `development` | |
 | `API_PREFIX` | `/api/v1` | |
-| `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME` | — | MySQL 8 |
-| `DB_CONNECTION_LIMIT` | `10` | Pool size |
-| `DB_SSL` | `false` | `true` for managed MySQL (Aiven, PlanetScale, RDS) |
-| `DB_SSL_CA` | — | Provider CA cert as PEM. Omitted ⇒ encrypted but unverified |
+| `MONGODB_URI` | — | **Required.** Atlas SRV string, database in the path |
+| `MONGODB_DB` | — | Optional override of the database in the URI |
+| `DNS_SERVERS` | — | See *Local DNS* below. Leave empty on Linux/Render |
 | `JWT_SECRET` | — | **Required.** Long random string |
 | `JWT_EXPIRES_IN` | `1d` | Access token TTL |
 | `REFRESH_TOKEN_EXPIRES_IN_DAYS` | `30` | |
-| `SEED_PASSWORD` | `demo@1234` | Seeder only |
+| `SEED_PASSWORD` | `demo@1234` | Seeder + the default for admin-created employees |
+
+### Local DNS
+
+`mongodb+srv://` needs an SRV lookup, and Node's bundled resolver refuses it on
+some Windows/router setups — you get `querySrv ECONNREFUSED` even though the
+cluster is reachable and `nslookup` resolves it fine. Set:
+
+```env
+DNS_SERVERS=8.8.8.8,1.1.1.1
+```
+
+`src/config/db.js` applies this with `dns.setServers()` before connecting. It's a
+local-machine workaround; leave it empty in production.
 
 ## API
 
 All routes are under `API_PREFIX` and need `Authorization: Bearer <token>`
-except `/auth/login`, `/auth/refresh` and `/health`.
+except `/auth/login`, `/auth/refresh` and the health endpoints.
 
 | Group | Endpoints |
 |---|---|
@@ -55,10 +77,39 @@ except `/auth/login`, `/auth/refresh` and `/health`.
 | `/approvals` | `GET /summary` · `GET,POST /leave` · `POST /leave/bulk-approve` · `GET,POST /expenses` · `GET,POST /regularizations` |
 | `/admin` | `GET /overview` · `GET,POST /employees` · `PATCH /employees/:id` · `GET /payroll/runs` · `POST /payroll/run` · `POST /payroll/runs/:id/publish` · `POST /payroll/runs/:id/unlock` · `POST,DELETE /announcements` · `GET /reports/{attendance,leave-balances,payroll-trend}` |
 | root | `GET /expenses` · `POST /expenses` · `GET /expenses/categories` · `GET /tasks` · `PATCH /tasks/:id` · `GET /holidays` · `GET /announcements` · `GET /notifications` · `PATCH /notifications/:id/read` · `POST /notifications/read-all` · `GET /directory` · `GET /departments` |
-| — | `GET /health` readiness (503 if MySQL down) · `GET /health/live` liveness — both outside the prefix |
+| — | `GET /health` readiness (503 if MongoDB is down) · `GET /health/live` liveness — both outside the prefix |
 
-Role guards live in `src/middleware/auth.js`: `/approvals` needs manager, `/admin`
-needs admin, admin passes every guard.
+Role guards live in `src/middleware/auth.js`: `/approvals` needs manager,
+`/admin` needs admin, admin passes every guard. Managers only ever see their own
+direct reports; admins see the whole org.
+
+## Data model
+
+22 collections, one per former SQL table, with `payslip_components` embedded into
+`payslips` (they're only ever read with their slip).
+
+Three conventions worth knowing:
+
+- **Calendar dates are `YYYY-MM-DD` strings**, clock times are `HH:mm:ss`
+  strings — not `Date`. ISO strings sort and range-compare correctly with
+  `$gte`/`$lte`, the API returns exactly what it always did, and no timezone can
+  shift a punch onto the wrong day. Real `Date` is used only for true instants
+  (`createdAt`, `actionOn`, `publishedAt`).
+- **Ids are ObjectId strings**, exposed as `id`. The MySQL build returned
+  integers, so any client that stored ids needs to treat them as opaque strings.
+- **Business codes come from a `counters` collection** (`$inc`, atomic) instead
+  of `SELECT COUNT(*) + offset`, which handed two concurrent requests the same
+  number. Bases live in `src/services/sequence.service.js`.
+
+Uniqueness that SQL enforced with `UNIQUE KEY` is now enforced by unique indexes
+— `employees.email`, `employees.empCode`, `(attendance.employeeId, workDate)`,
+`(payslips.payrollRunId, employeeId)`, `(payrollRuns.payMonth, payYear)` and the
+request codes. `npm run db:migrate` builds them; refresh tokens also get a TTL
+index so Mongo expires them without a cleanup job.
+
+Multi-document writes (leave approval, payroll run, employee creation) run in
+transactions via `withTransaction()`. These need a replica set — Atlas is one. On
+a standalone `mongod` the helper warns once and falls back to unbatched writes.
 
 ## Layout
 
@@ -66,73 +117,60 @@ needs admin, admin passes every guard.
 src/
 ├─ server.js          entry point — listen + graceful shutdown
 ├─ app.js             express wiring, helmet/cors/rate-limit, route mounting
-├─ config/            env.js (validated config), db.js (pool + query helpers)
-├─ db/                schema.sql, migrate.js, seed.js
+├─ config/            env.js (validated config), db.js (connection + transactions)
+├─ models/            mongoose schemas, one file per domain
+├─ db/                migrate.js (indexes), seed.js (demo data)
 ├─ middleware/        auth.js (JWT + role guards), error.js
 ├─ routes/            one file per module
-├─ services/          employee + payroll logic shared across routes
-└─ utils/             ApiError, asyncHandler, response helpers
+├─ services/          employee, payroll and sequence logic shared across routes
+└─ utils/             ApiError, asyncHandler, date/response helpers
+scripts/              smoke.js, verify-writes.js
 ```
 
-## Deploy — Render + Aiven MySQL
+## Deploy — Render + MongoDB Atlas
 
-`render.yaml` is a Render Blueprint; Aiven supplies the MySQL 8 that Render
-doesn't offer. The app is MySQL-specific (`ENUM`, `ON UPDATE CURRENT_TIMESTAMP`),
-so Render's own Postgres is not a drop-in swap.
+`render.yaml` is a Render Blueprint.
 
-**1 — Aiven MySQL**
+**1 — Atlas**
 
-Create a free *MySQL* service (Aiven console → Services → MySQL → free plan).
-From the service *Overview* tab collect: Host, Port, User (`avnadmin`),
-Password, and download **CA Certificate** (`ca.pem`).
+Create a free M0 cluster. Under *Database Access* add a user; under *Network
+Access* allow Render's egress (or `0.0.0.0/0` if you accept the exposure). Copy
+the connection string and put the database name in the path:
 
-**2 — Create the database and load it (run locally)**
-
-Aiven's free plan has no shell, so point your local `.env` at Aiven and run the
-scripts from your machine:
-
-```env
-DB_HOST=mysql-xxxx.aivencloud.com
-DB_PORT=12345
-DB_USER=avnadmin
-DB_PASSWORD=<aiven password>
-DB_NAME=chanda_hr        # not defaultdb — migrate creates this one
-DB_SSL=true
-DB_SSL_CA="-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----"
 ```
+mongodb+srv://<user>:<password>@<cluster>.mongodb.net/hrmh?retryWrites=true&w=majority
+```
+
+**2 — Load the data (from your machine)**
 
 ```bash
-npm run db:migrate      # creates chanda_hr + 20 tables
-npm run db:seed         # demo employees, attendance, leave, payroll
+npm run db:migrate
+npm run db:seed
 ```
-
-Don't use `db:reset` / `--fresh` against Aiven unless you mean it — it drops the
-database first.
 
 **3 — Render**
 
 New → **Blueprint** → pick this repo. Render reads `render.yaml` and prompts for
-the six `sync: false` vars — paste the same Aiven values (`DB_SSL_CA` as the full
-PEM, newlines and all). `JWT_SECRET` is generated automatically; **don't** reuse
-your local one.
+`MONGODB_URI`; `JWT_SECRET` is generated automatically — **don't** reuse your
+local one.
 
-Health check is `/health/live` (liveness). Hit `/health` yourself to confirm the
-database leg: it returns `{"status":"ok","database":"up"}` when Aiven is wired up.
+Health check is `/health/live`. Hit `/health` yourself to confirm the database
+leg: it returns `{"status":"ok","database":"up"}` when Atlas is wired up.
 
 **Free-tier caveats**
 
-- Render free spins down after ~15 min idle — first request then takes ~50s.
-- Aiven free caps connections; `DB_CONNECTION_LIMIT` is set to `5` in the blueprint.
-- Both free tiers are fine for demos, not for production payroll data.
+- Render free spins down after ~15 min idle — the first request then takes ~50s.
+- Atlas M0 is shared and capped at 512 MB.
+- Fine for demos, not for production payroll data.
 
 Any other Node host works too — set the env vars above and run `npm ci && npm start`.
-`src/server.js` binds the port before pinging MySQL so health checks pass during a
-cold start, and handles `SIGTERM` for clean restarts.
+`src/server.js` binds the port before connecting to MongoDB so health checks pass
+during a cold start, and handles `SIGTERM` for clean restarts.
 
 ## Not built yet
 
-- File upload for expense receipts / leave attachments (`receipt_path` and
-  `attachment_path` columns exist but no multipart route)
+- File upload for expense receipts / leave attachments (`receiptPath` and
+  `attachmentPath` fields exist but no multipart route)
 - Forgot / reset password
 - CSV report export
 - Masters CRUD (departments, shifts, locations, leave types)

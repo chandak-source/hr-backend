@@ -1,71 +1,162 @@
 import bcrypt from 'bcryptjs';
 import { Router } from 'express';
+import mongoose from 'mongoose';
 import { z } from 'zod';
 
 import { env } from '../config/env.js';
-import { execute, query, queryOne, transaction } from '../config/db.js';
+import { withTransaction } from '../config/db.js';
+import {
+  Announcement,
+  Attendance,
+  Department,
+  Employee,
+  ExpenseClaim,
+  LeaveBalance,
+  LeaveRequest,
+  Location,
+  Notification,
+  PayrollRun,
+  Payslip,
+  RegularizationRequest,
+  SalaryStructure,
+  Shift,
+} from '../models/index.js';
 import { authenticate, requireRole } from '../middleware/auth.js';
 import { ApiError } from '../utils/ApiError.js';
-import { asyncHandler, created, ok, parseWith, todayString } from '../utils/helpers.js';
-import { EMPLOYEE_JOINS, EMPLOYEE_SELECT } from '../services/employee.service.js';
+import {
+  asyncHandler,
+  created,
+  daysAgoString,
+  monthRange,
+  ok,
+  parseWith,
+  round2,
+  searchFilter,
+  todayString,
+} from '../utils/helpers.js';
+import { findEmployees, idForEmpCode } from '../services/employee.service.js';
+import { nextCode } from '../services/sequence.service.js';
 import { computePayslip, countLopDays, MONTH_NAMES } from '../services/payroll.service.js';
 
 const router = Router();
 router.use(authenticate, requireRole('admin'));
 
+const WORKED = ['present', 'late_in', 'half_day'];
+const OFF = ['week_off', 'holiday'];
+
+/** Percentage of non-off days that were actually worked, over a date range. */
+const attendancePercentStage = {
+  $group: {
+    _id: '$workDate',
+    worked: { $sum: { $cond: [{ $in: ['$status', WORKED] }, 1, 0] } },
+    counted: { $sum: { $cond: [{ $in: ['$status', OFF] }, 0, 1] } },
+  },
+};
+
 // ============================================================== overview ====
 router.get(
   '/overview',
   asyncHandler(async (_req, res) => {
-    const headcount = await queryOne(
-      `SELECT
-         COUNT(*) AS total,
-         SUM(status = 'active') AS active,
-         SUM(date_of_joining >= DATE_FORMAT(CURDATE(), '%Y-%m-01')) AS newJoinees,
-         SUM(status = 'exited' AND exit_date >= DATE_FORMAT(CURDATE(), '%Y-%m-01')) AS exitsThisMonth
-       FROM employees`,
-    );
+    const monthStart = `${todayString().slice(0, 7)}-01`;
 
-    const attendance = await queryOne(
-      `SELECT ROUND(100 * SUM(status IN ('present','late_in','half_day')) / NULLIF(SUM(status NOT IN ('week_off','holiday')), 0), 1) AS avgAttendance
-         FROM attendance
-        WHERE work_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)`,
-    );
+    const [headcountRow] = await Employee.aggregate([
+      {
+        $group: {
+          _id: null,
+          total: { $sum: 1 },
+          active: { $sum: { $cond: [{ $eq: ['$status', 'active'] }, 1, 0] } },
+          newJoinees: { $sum: { $cond: [{ $gte: ['$dateOfJoining', monthStart] }, 1, 0] } },
+          exitsThisMonth: {
+            $sum: {
+              $cond: [
+                {
+                  $and: [
+                    { $eq: ['$status', 'exited'] },
+                    { $gte: [{ $ifNull: ['$exitDate', ''] }, monthStart] },
+                  ],
+                },
+                1,
+                0,
+              ],
+            },
+          },
+        },
+      },
+      { $project: { _id: 0 } },
+    ]);
 
-    const approvals = await queryOne(
-      `SELECT
-        (SELECT COUNT(*) FROM leave_requests WHERE status = 'pending') +
-        (SELECT COUNT(*) FROM expense_claims WHERE status = 'pending') +
-        (SELECT COUNT(*) FROM regularization_requests WHERE status = 'pending') AS pending`,
-    );
+    const last30 = await Attendance.aggregate([
+      { $match: { workDate: { $gte: daysAgoString(30) } } },
+      {
+        $group: {
+          _id: null,
+          worked: { $sum: { $cond: [{ $in: ['$status', WORKED] }, 1, 0] } },
+          counted: { $sum: { $cond: [{ $in: ['$status', OFF] }, 0, 1] } },
+        },
+      },
+    ]);
+    const avgAttendance = last30[0]?.counted
+      ? round2((100 * last30[0].worked) / last30[0].counted)
+      : 0;
 
-    const payroll = await queryOne(
-      `SELECT pr.pay_month AS month, pr.pay_year AS year, pr.status,
-              pr.total_net AS totalNet, pr.employee_count AS employees
-         FROM payroll_runs pr ORDER BY pr.pay_year DESC, pr.pay_month DESC LIMIT 1`,
-    );
+    const [leaves, expenses, regularizations] = await Promise.all([
+      LeaveRequest.countDocuments({ status: 'pending' }),
+      ExpenseClaim.countDocuments({ status: 'pending' }),
+      RegularizationRequest.countDocuments({ status: 'pending' }),
+    ]);
 
-    const byDept = await query(
-      `SELECT d.name, COUNT(e.id) AS headcount
-         FROM departments d LEFT JOIN employees e ON e.department_id = d.id AND e.status <> 'exited'
-        GROUP BY d.id ORDER BY headcount DESC`,
-    );
+    const payroll = await PayrollRun.findOne().sort({ payYear: -1, payMonth: -1 }).lean();
 
-    const trend = await query(
-      `SELECT work_date AS date,
-              ROUND(100 * SUM(status IN ('present','late_in','half_day')) / NULLIF(SUM(status NOT IN ('week_off','holiday')), 0)) AS percent
-         FROM attendance
-        WHERE work_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
-        GROUP BY work_date ORDER BY work_date`,
-    );
+    const byDept = await Department.aggregate([
+      {
+        $lookup: {
+          from: 'employees',
+          let: { did: '$_id' },
+          pipeline: [
+            {
+              $match: {
+                $expr: { $and: [{ $eq: ['$departmentId', '$$did'] }, { $ne: ['$status', 'exited'] }] },
+              },
+            },
+            { $count: 'n' },
+          ],
+          as: 'staff',
+        },
+      },
+      { $project: { _id: 0, name: 1, headcount: { $ifNull: [{ $first: '$staff.n' }, 0] } } },
+      { $sort: { headcount: -1 } },
+    ]);
+
+    const trend = await Attendance.aggregate([
+      { $match: { workDate: { $gte: daysAgoString(7) } } },
+      attendancePercentStage,
+      {
+        $project: {
+          _id: 0,
+          date: '$_id',
+          percent: {
+            $cond: [
+              { $gt: ['$counted', 0] },
+              { $round: [{ $multiply: [100, { $divide: ['$worked', '$counted'] }] }, 0] },
+              null,
+            ],
+          },
+        },
+      },
+      { $sort: { date: 1 } },
+    ]);
 
     ok(res, {
-      headcount,
-      avgAttendance: attendance.avgAttendance ?? 0,
-      pendingApprovals: Number(approvals.pending),
+      headcount: headcountRow ?? { total: 0, active: 0, newJoinees: 0, exitsThisMonth: 0 },
+      avgAttendance,
+      pendingApprovals: leaves + expenses + regularizations,
       latestPayroll: payroll && {
-        ...payroll,
-        period: `${MONTH_NAMES[payroll.month - 1]} ${payroll.year}`,
+        month: payroll.payMonth,
+        year: payroll.payYear,
+        status: payroll.status,
+        totalNet: payroll.totalNet,
+        employees: payroll.employeeCount,
+        period: `${MONTH_NAMES[payroll.payMonth - 1]} ${payroll.payYear}`,
       },
       headcountByDepartment: byDept,
       attendanceTrend: trend,
@@ -100,19 +191,15 @@ router.get(
       req.query,
     );
 
-    const where = ['1 = 1'];
-    const params = [];
-    if (q) {
-      where.push('(e.name LIKE ? OR e.emp_code LIKE ? OR e.designation LIKE ?)');
-      params.push(`%${q}%`, `%${q}%`, `%${q}%`);
+    const match = {};
+    if (q) Object.assign(match, searchFilter(q, ['name', 'empCode', 'designation']));
+    if (status) match.status = status;
+    if (department && department !== 'All') {
+      const dept = await Department.findOne({ name: department }).select('_id').lean();
+      match.departmentId = dept?._id ?? null;
     }
-    if (department && department !== 'All') { where.push('d.name = ?'); params.push(department); }
-    if (status) { where.push('e.status = ?'); params.push(status); }
 
-    const rows = await query(
-      `SELECT ${EMPLOYEE_SELECT} ${EMPLOYEE_JOINS} WHERE ${where.join(' AND ')} ORDER BY e.name LIMIT ${limit}`,
-      params,
-    );
+    const rows = await findEmployees(match, { sort: { name: 1 }, limit });
     ok(res, rows, { count: rows.length });
   }),
 );
@@ -122,61 +209,63 @@ router.post(
   asyncHandler(async (req, res) => {
     const body = parseWith(createEmployeeSchema, req.body);
 
-    const dept = await queryOne('SELECT id FROM departments WHERE name = ?', [body.department]);
+    const dept = await Department.findOne({ name: body.department }).select('_id').lean();
     if (!dept) throw ApiError.badRequest(`Unknown department "${body.department}"`);
 
-    const manager = body.reportingToCode
-      ? await queryOne('SELECT id FROM employees WHERE emp_code = ?', [body.reportingToCode])
-      : null;
-    if (body.reportingToCode && !manager) {
-      throw ApiError.badRequest(`Unknown manager code "${body.reportingToCode}"`);
+    let managerId = null;
+    if (body.reportingToCode) {
+      managerId = await idForEmpCode(body.reportingToCode);
+      if (!managerId) throw ApiError.badRequest(`Unknown manager code "${body.reportingToCode}"`);
     }
 
     const location = body.location
-      ? await queryOne('SELECT id FROM locations WHERE name = ?', [body.location])
+      ? await Location.findOne({ name: body.location }).select('_id').lean()
       : null;
+    const generalShift = await Shift.findOne({ name: 'General' }).select('_id').lean();
 
-    const result = await transaction(async (conn) => {
-      const [seq] = await conn.query("SELECT COUNT(*) AS n FROM employees WHERE role = 'employee'");
-      const empCode = `EMP${1170 + Number(seq[0].n)}`;
+    const passwordHash = await bcrypt.hash(env.seedPassword, 10);
 
-      const [insert] = await conn.execute(
-        `INSERT INTO employees
-           (emp_code, name, email, phone, password_hash, role, designation, department_id,
-            location_id, shift_id, reporting_to, date_of_joining)
-         VALUES (?,?,?,?,?,?,?,?,?,(SELECT id FROM shifts WHERE name = 'General'),?,?)`,
+    const result = await withTransaction(async (session) => {
+      const empCode = await nextCode('EMP', 'employee', session);
+
+      const [employee] = await Employee.create(
         [
-          empCode,
-          body.name,
-          body.email,
-          body.phone ?? null,
-          await bcrypt.hash(env.seedPassword, 10),
-          body.role,
-          body.designation,
-          dept.id,
-          location?.id ?? null,
-          manager?.id ?? null,
-          body.dateOfJoining,
+          {
+            empCode,
+            name: body.name,
+            email: body.email,
+            phone: body.phone ?? null,
+            passwordHash,
+            role: body.role,
+            designation: body.designation,
+            departmentId: dept._id,
+            locationId: location?._id ?? null,
+            shiftId: generalShift?._id ?? null,
+            reportingTo: managerId,
+            dateOfJoining: body.dateOfJoining,
+          },
         ],
+        { session },
       );
 
       const monthly = body.annualCtc / 12;
-      await conn.execute(
-        `INSERT INTO salary_structures
-           (employee_id, effective_from, annual_ctc, basic, hra, conveyance, special_allowance)
-         VALUES (?,?,?,?,?,?,?)`,
+      await SalaryStructure.create(
         [
-          insert.insertId,
-          body.dateOfJoining,
-          body.annualCtc,
-          Math.round(monthly * 0.5),
-          Math.round(monthly * 0.2),
-          Math.round(monthly * 0.05),
-          Math.round(monthly * 0.25),
+          {
+            employeeId: employee._id,
+            effectiveFrom: body.dateOfJoining,
+            annualCtc: body.annualCtc,
+            basic: Math.round(monthly * 0.5),
+            hra: Math.round(monthly * 0.2),
+            conveyance: Math.round(monthly * 0.05),
+            specialAllowance: Math.round(monthly * 0.25),
+            isCurrent: true,
+          },
         ],
+        { session },
       );
 
-      return { id: insert.insertId, empCode };
+      return { id: employee._id.toString(), empCode };
     });
 
     created(res, {
@@ -200,35 +289,33 @@ router.patch(
       req.body ?? {},
     );
 
-    const employee = await queryOne('SELECT id FROM employees WHERE id = ?', [req.params.id]);
-    if (!employee) throw ApiError.notFound('Employee not found');
+    if (!mongoose.isValidObjectId(req.params.id)) throw ApiError.notFound('Employee not found');
+    const exists = await Employee.exists({ _id: req.params.id });
+    if (!exists) throw ApiError.notFound('Employee not found');
 
-    const sets = [];
-    const params = [];
-
-    if (body.designation) { sets.push('designation = ?'); params.push(body.designation); }
-    if (body.role) { sets.push('role = ?'); params.push(body.role); }
+    const update = {};
+    if (body.designation) update.designation = body.designation;
+    if (body.role) update.role = body.role;
     if (body.status) {
-      sets.push('status = ?');
-      params.push(body.status);
-      if (body.status === 'exited') { sets.push('exit_date = ?'); params.push(todayString()); }
+      update.status = body.status;
+      if (body.status === 'exited') update.exitDate = todayString();
     }
     if (body.department) {
-      const dept = await queryOne('SELECT id FROM departments WHERE name = ?', [body.department]);
+      const dept = await Department.findOne({ name: body.department }).select('_id').lean();
       if (!dept) throw ApiError.badRequest(`Unknown department "${body.department}"`);
-      sets.push('department_id = ?');
-      params.push(dept.id);
+      update.departmentId = dept._id;
     }
     if (body.reportingToCode) {
-      const manager = await queryOne('SELECT id FROM employees WHERE emp_code = ?', [body.reportingToCode]);
-      if (!manager) throw ApiError.badRequest(`Unknown manager code "${body.reportingToCode}"`);
-      sets.push('reporting_to = ?');
-      params.push(manager.id);
+      const managerId = await idForEmpCode(body.reportingToCode);
+      if (!managerId) throw ApiError.badRequest(`Unknown manager code "${body.reportingToCode}"`);
+      update.reportingTo = managerId;
     }
-    if (!sets.length) throw ApiError.badRequest('Nothing to update');
+    if (!Object.keys(update).length) throw ApiError.badRequest('Nothing to update');
 
-    await execute(`UPDATE employees SET ${sets.join(', ')} WHERE id = ?`, [...params, req.params.id]);
-    ok(res, await queryOne(`SELECT ${EMPLOYEE_SELECT} ${EMPLOYEE_JOINS} WHERE e.id = ?`, [req.params.id]));
+    await Employee.updateOne({ _id: req.params.id }, { $set: update });
+
+    const [row] = await findEmployees({ _id: new mongoose.Types.ObjectId(String(req.params.id)) });
+    ok(res, row);
   }),
 );
 
@@ -236,16 +323,28 @@ router.patch(
 router.get(
   '/payroll/runs',
   asyncHandler(async (_req, res) => {
-    const rows = await query(
-      `SELECT pr.id, pr.pay_month AS month, pr.pay_year AS year, pr.status,
-              pr.employee_count AS employees, pr.total_gross AS totalGross,
-              pr.total_deductions AS totalDeductions, pr.total_net AS totalNet,
-              pr.processed_at AS processedAt, pr.published_at AS publishedAt,
-              e.name AS processedBy
-         FROM payroll_runs pr LEFT JOIN employees e ON e.id = pr.processed_by
-        ORDER BY pr.pay_year DESC, pr.pay_month DESC`,
+    const rows = await PayrollRun.find()
+      .sort({ payYear: -1, payMonth: -1 })
+      .populate('processedBy', 'name')
+      .lean();
+
+    ok(
+      res,
+      rows.map((r) => ({
+        id: r._id.toString(),
+        month: r.payMonth,
+        year: r.payYear,
+        status: r.status,
+        employees: r.employeeCount,
+        totalGross: r.totalGross,
+        totalDeductions: r.totalDeductions,
+        totalNet: r.totalNet,
+        processedAt: r.processedAt,
+        publishedAt: r.publishedAt,
+        processedBy: r.processedBy?.name ?? null,
+        period: `${MONTH_NAMES[r.payMonth - 1]} ${r.payYear}`,
+      })),
     );
-    ok(res, rows.map((r) => ({ ...r, period: `${MONTH_NAMES[r.month - 1]} ${r.year}` })));
   }),
 );
 
@@ -260,58 +359,60 @@ router.post(
   asyncHandler(async (req, res) => {
     const { month, year } = parseWith(runSchema, req.body);
 
-    const existing = await queryOne(
-      'SELECT id, status FROM payroll_runs WHERE pay_month = ? AND pay_year = ?',
-      [month, year],
-    );
+    const existing = await PayrollRun.findOne({ payMonth: month, payYear: year }).lean();
     if (existing && existing.status !== 'draft') {
-      throw ApiError.conflict(`Payroll for ${MONTH_NAMES[month - 1]} ${year} is already ${existing.status}`);
+      throw ApiError.conflict(
+        `Payroll for ${MONTH_NAMES[month - 1]} ${year} is already ${existing.status}`,
+      );
     }
 
-    const employees = await query(
-      `SELECT e.id, s.id AS structureId, s.basic, s.hra, s.conveyance, s.special_allowance, e.bank_account
-         FROM employees e
-         JOIN salary_structures s ON s.employee_id = e.id AND s.is_current = 1
-        WHERE e.status = 'active'`,
-    );
-    if (!employees.length) throw ApiError.badRequest('No active employees with salary structures');
+    const actives = await Employee.find({ status: 'active' })
+      .select('_id bankAccount')
+      .lean();
+    const structures = await SalaryStructure.find({
+      employeeId: { $in: actives.map((e) => e._id) },
+      isCurrent: true,
+    }).lean();
+    const structureBy = new Map(structures.map((s) => [s.employeeId.toString(), s]));
 
-    const summary = await transaction(async (conn) => {
-      let runId = existing?.id;
+    const payable = actives.filter((e) => structureBy.has(e._id.toString()));
+    if (!payable.length) throw ApiError.badRequest('No active employees with salary structures');
+
+    const summary = await withTransaction(async (session) => {
+      let runId = existing?._id;
       if (runId) {
-        await conn.execute('DELETE FROM payslips WHERE payroll_run_id = ?', [runId]);
+        await Payslip.deleteMany({ payrollRunId: runId }, { session });
       } else {
-        const [runInsert] = await conn.execute(
-          `INSERT INTO payroll_runs (pay_month, pay_year, status, processed_by) VALUES (?,?,'draft',?)`,
-          [month, year, req.user.id],
+        const [run] = await PayrollRun.create(
+          [{ payMonth: month, payYear: year, status: 'draft', processedBy: req.user._id }],
+          { session },
         );
-        runId = runInsert.insertId;
+        runId = run._id;
       }
 
       let totals = { gross: 0, deductions: 0, net: 0 };
+      const slips = [];
 
-      for (const emp of employees) {
+      for (const emp of payable) {
+        const structure = structureBy.get(emp._id.toString());
         // eslint-disable-next-line no-await-in-loop
-        const lopDays = await countLopDays(conn, emp.id, month, year);
-        const slip = computePayslip({ structure: emp, month, year, lopDays });
+        const lopDays = await countLopDays(emp._id, month, year, session);
+        const slip = computePayslip({ structure, month, year, lopDays });
 
-        // eslint-disable-next-line no-await-in-loop
-        const [slipInsert] = await conn.execute(
-          `INSERT INTO payslips
-             (payroll_run_id, employee_id, paid_days, lop_days, gross, deductions, net, bank_account)
-           VALUES (?,?,?,?,?,?,?,?)`,
-          [runId, emp.id, slip.paidDays, slip.lopDays, slip.gross, slip.deductions, slip.net, emp.bank_account],
-        );
-
-        const components = [
-          ...slip.earnings.map((c, i) => [slipInsert.insertId, c.label, 'earning', c.amount, i]),
-          ...slip.deductionItems.map((c, i) => [slipInsert.insertId, c.label, 'deduction', c.amount, i]),
-        ];
-        // eslint-disable-next-line no-await-in-loop
-        await conn.query(
-          'INSERT INTO payslip_components (payslip_id, label, component_type, amount, sort_order) VALUES ?',
-          [components],
-        );
+        slips.push({
+          payrollRunId: runId,
+          employeeId: emp._id,
+          paidDays: slip.paidDays,
+          lopDays: slip.lopDays,
+          gross: slip.gross,
+          deductions: slip.deductions,
+          net: slip.net,
+          bankAccount: emp.bankAccount ?? null,
+          components: [
+            ...slip.earnings.map((c, i) => ({ ...c, type: 'earning', sortOrder: i })),
+            ...slip.deductionItems.map((c, i) => ({ ...c, type: 'deduction', sortOrder: i })),
+          ],
+        });
 
         totals = {
           gross: totals.gross + slip.gross,
@@ -320,15 +421,25 @@ router.post(
         };
       }
 
-      await conn.execute(
-        `UPDATE payroll_runs
-            SET status = 'processed', employee_count = ?, total_gross = ?, total_deductions = ?,
-                total_net = ?, processed_by = ?, processed_at = NOW()
-          WHERE id = ?`,
-        [employees.length, totals.gross.toFixed(2), totals.deductions.toFixed(2), totals.net.toFixed(2), req.user.id, runId],
+      await Payslip.insertMany(slips, { session });
+
+      await PayrollRun.updateOne(
+        { _id: runId },
+        {
+          $set: {
+            status: 'processed',
+            employeeCount: payable.length,
+            totalGross: round2(totals.gross),
+            totalDeductions: round2(totals.deductions),
+            totalNet: round2(totals.net),
+            processedBy: req.user._id,
+            processedAt: new Date(),
+          },
+        },
+        { session },
       );
 
-      return { runId, employees: employees.length, ...totals };
+      return { runId: runId.toString(), employees: payable.length, ...totals };
     });
 
     ok(res, {
@@ -343,31 +454,46 @@ router.post(
 router.post(
   '/payroll/runs/:id/publish',
   asyncHandler(async (req, res) => {
-    const run = await queryOne('SELECT * FROM payroll_runs WHERE id = ?', [req.params.id]);
+    if (!mongoose.isValidObjectId(req.params.id)) throw ApiError.notFound('Payroll run not found');
+
+    const run = await PayrollRun.findById(req.params.id).lean();
     if (!run) throw ApiError.notFound('Payroll run not found');
     if (run.status === 'published') throw ApiError.conflict('Run is already published');
     if (run.status === 'draft') throw ApiError.badRequest('Process the run before publishing');
 
-    await transaction(async (conn) => {
-      await conn.execute(
-        `UPDATE payroll_runs SET status = 'published', published_at = NOW() WHERE id = ?`,
-        [run.id],
+    const period = `${MONTH_NAMES[run.payMonth - 1]} ${run.payYear}`;
+
+    await withTransaction(async (session) => {
+      await PayrollRun.updateOne(
+        { _id: run._id },
+        { $set: { status: 'published', publishedAt: new Date() } },
+        { session },
       );
-      await conn.execute(
-        `UPDATE payslips SET credited_on = CURDATE() WHERE payroll_run_id = ?`,
-        [run.id],
+      await Payslip.updateMany(
+        { payrollRunId: run._id },
+        { $set: { creditedOn: todayString() } },
+        { session },
       );
-      await conn.execute(
-        `INSERT INTO notifications (employee_id, title, subtitle, kind)
-         SELECT p.employee_id, 'Payslip available',
-                CONCAT('${MONTH_NAMES[run.pay_month - 1]} ${run.pay_year} payslip published. Net pay ₹', FORMAT(p.net, 0), '.'),
-                'payroll'
-           FROM payslips p WHERE p.payroll_run_id = ?`,
-        [run.id],
-      );
+
+      const slips = await Payslip.find({ payrollRunId: run._id })
+        .select('employeeId net')
+        .session(session)
+        .lean();
+
+      if (slips.length) {
+        await Notification.insertMany(
+          slips.map((p) => ({
+            employeeId: p.employeeId,
+            title: 'Payslip available',
+            subtitle: `${period} payslip published. Net pay ₹${Math.round(p.net).toLocaleString('en-IN')}.`,
+            kind: 'payroll',
+          })),
+          { session },
+        );
+      }
     });
 
-    ok(res, { id: run.id, status: 'published' });
+    ok(res, { id: run._id.toString(), status: 'published' });
   }),
 );
 
@@ -375,12 +501,17 @@ router.post(
 router.post(
   '/payroll/runs/:id/unlock',
   asyncHandler(async (req, res) => {
-    const result = await execute(
-      `UPDATE payroll_runs SET status = 'draft', published_at = NULL WHERE id = ? AND status <> 'draft'`,
-      [req.params.id],
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      throw ApiError.notFound('Run not found or already draft');
+    }
+
+    const result = await PayrollRun.updateOne(
+      { _id: req.params.id, status: { $ne: 'draft' } },
+      { $set: { status: 'draft', publishedAt: null } },
     );
-    if (!result.affectedRows) throw ApiError.notFound('Run not found or already draft');
-    ok(res, { id: Number(req.params.id), status: 'draft' });
+    if (!result.matchedCount) throw ApiError.notFound('Run not found or already draft');
+
+    ok(res, { id: req.params.id, status: 'draft' });
   }),
 );
 
@@ -397,22 +528,23 @@ router.post(
       req.body,
     );
 
-    const result = await execute(
-      'INSERT INTO announcements (title, body, category, published_by) VALUES (?,?,?,?)',
-      [body.title, body.body, body.category, req.user.id],
-    );
-    created(res, { id: result.insertId, ...body, publishedBy: req.user.name });
+    const doc = await Announcement.create({ ...body, publishedBy: req.user._id });
+    created(res, { id: doc._id.toString(), ...body, publishedBy: req.user.name });
   }),
 );
 
 router.delete(
   '/announcements/:id',
   asyncHandler(async (req, res) => {
-    const result = await execute('UPDATE announcements SET is_active = 0 WHERE id = ?', [
-      req.params.id,
-    ]);
-    if (!result.affectedRows) throw ApiError.notFound('Announcement not found');
-    ok(res, { id: Number(req.params.id), archived: true });
+    if (!mongoose.isValidObjectId(req.params.id)) throw ApiError.notFound('Announcement not found');
+
+    const result = await Announcement.updateOne(
+      { _id: req.params.id },
+      { $set: { isActive: false } },
+    );
+    if (!result.matchedCount) throw ApiError.notFound('Announcement not found');
+
+    ok(res, { id: req.params.id, archived: true });
   }),
 );
 
@@ -428,23 +560,60 @@ router.get(
       }),
       req.query,
     );
+    const { from, to } = monthRange(month, year);
 
-    const rows = await query(
-      `SELECT e.emp_code AS empCode, e.name, d.name AS department,
-              SUM(a.status IN ('present','late_in')) AS present,
-              SUM(a.status = 'half_day') AS halfDays,
-              SUM(a.status = 'leave') AS leaves,
-              SUM(a.status IN ('absent','miss_punch')) AS absent,
-              SUM(a.status = 'late_in') AS lateIns,
-              ROUND(SUM(a.total_minutes) / 60, 1) AS totalHours
-         FROM employees e
-         LEFT JOIN departments d ON d.id = e.department_id
-         LEFT JOIN attendance a ON a.employee_id = e.id
-              AND MONTH(a.work_date) = ? AND YEAR(a.work_date) = ?
-        WHERE e.status <> 'exited'
-        GROUP BY e.id ORDER BY e.name`,
-      [month, year],
-    );
+    const rows = await Employee.aggregate([
+      { $match: { status: { $ne: 'exited' } } },
+      { $lookup: { from: 'departments', localField: 'departmentId', foreignField: '_id', as: 'dept' } },
+      {
+        $lookup: {
+          from: 'attendances',
+          let: { eid: '$_id' },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ['$employeeId', '$$eid'] },
+                    { $gte: ['$workDate', from] },
+                    { $lte: ['$workDate', to] },
+                  ],
+                },
+              },
+            },
+            {
+              $group: {
+                _id: null,
+                present: { $sum: { $cond: [{ $in: ['$status', ['present', 'late_in']] }, 1, 0] } },
+                halfDays: { $sum: { $cond: [{ $eq: ['$status', 'half_day'] }, 1, 0] } },
+                leaves: { $sum: { $cond: [{ $eq: ['$status', 'leave'] }, 1, 0] } },
+                absent: { $sum: { $cond: [{ $in: ['$status', ['absent', 'miss_punch']] }, 1, 0] } },
+                lateIns: { $sum: { $cond: [{ $eq: ['$status', 'late_in'] }, 1, 0] } },
+                minutes: { $sum: '$totalMinutes' },
+              },
+            },
+          ],
+          as: 'a',
+        },
+      },
+      { $addFields: { a: { $first: '$a' } } },
+      {
+        $project: {
+          _id: 0,
+          empCode: 1,
+          name: 1,
+          department: { $ifNull: [{ $first: '$dept.name' }, null] },
+          present: { $ifNull: ['$a.present', 0] },
+          halfDays: { $ifNull: ['$a.halfDays', 0] },
+          leaves: { $ifNull: ['$a.leaves', 0] },
+          absent: { $ifNull: ['$a.absent', 0] },
+          lateIns: { $ifNull: ['$a.lateIns', 0] },
+          totalHours: { $round: [{ $divide: [{ $ifNull: ['$a.minutes', 0] }, 60] }, 1] },
+        },
+      },
+      { $sort: { name: 1 } },
+    ]);
+
     ok(res, rows, { month, year, period: `${MONTH_NAMES[month - 1]} ${year}` });
   }),
 );
@@ -452,30 +621,48 @@ router.get(
 router.get(
   '/reports/leave-balances',
   asyncHandler(async (_req, res) => {
-    const rows = await query(
-      `SELECT e.emp_code AS empCode, e.name,
-              lt.code AS leaveType,
-              lb.allotted + lb.carried_forward AS total, lb.used,
-              lb.allotted + lb.carried_forward - lb.used AS available
-         FROM leave_balances lb
-         JOIN employees e ON e.id = lb.employee_id
-         JOIN leave_types lt ON lt.id = lb.leave_type_id
-        WHERE e.status <> 'exited'
-        ORDER BY e.name, lt.id`,
-    );
-    ok(res, rows);
+    const rows = await LeaveBalance.find()
+      .populate({ path: 'employeeId', select: 'name empCode status' })
+      .populate({ path: 'leaveTypeId', select: 'code sortOrder' })
+      .lean();
+
+    const report = rows
+      .filter((b) => b.employeeId && b.employeeId.status !== 'exited' && b.leaveTypeId)
+      .sort(
+        (a, b) =>
+          a.employeeId.name.localeCompare(b.employeeId.name) ||
+          (a.leaveTypeId.sortOrder ?? 0) - (b.leaveTypeId.sortOrder ?? 0),
+      )
+      .map((b) => ({
+        empCode: b.employeeId.empCode,
+        name: b.employeeId.name,
+        leaveType: b.leaveTypeId.code,
+        total: b.allotted + b.carriedForward,
+        used: b.used,
+        available: b.allotted + b.carriedForward - b.used,
+      }));
+
+    ok(res, report);
   }),
 );
 
 router.get(
   '/reports/payroll-trend',
   asyncHandler(async (_req, res) => {
-    const rows = await query(
-      `SELECT pay_month AS month, pay_year AS year, total_net AS totalNet, employee_count AS employees
-         FROM payroll_runs WHERE status IN ('processed','locked','published')
-        ORDER BY pay_year, pay_month`,
+    const rows = await PayrollRun.find({ status: { $in: ['processed', 'locked', 'published'] } })
+      .sort({ payYear: 1, payMonth: 1 })
+      .lean();
+
+    ok(
+      res,
+      rows.map((r) => ({
+        month: r.payMonth,
+        year: r.payYear,
+        totalNet: r.totalNet,
+        employees: r.employeeCount,
+        period: `${MONTH_NAMES[r.payMonth - 1]} ${r.payYear}`,
+      })),
     );
-    ok(res, rows.map((r) => ({ ...r, period: `${MONTH_NAMES[r.month - 1]} ${r.year}` })));
   }),
 );
 

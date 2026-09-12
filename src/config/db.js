@@ -1,62 +1,76 @@
-import mysql from 'mysql2/promise';
+import dns from 'node:dns';
+
+import mongoose from 'mongoose';
 
 import { env } from './env.js';
 
-export const pool = mysql.createPool({
-  host: env.db.host,
-  port: env.db.port,
-  user: env.db.user,
-  password: env.db.password,
-  database: env.db.database,
-  ssl: env.db.ssl,
-  waitForConnections: true,
-  connectionLimit: env.db.connectionLimit,
-  queueLimit: 0,
-  dateStrings: ['DATE', 'DATETIME'],
-  timezone: 'local',
-  charset: 'utf8mb4_unicode_ci',
-  decimalNumbers: true,
-});
+if (env.mongo.dnsServers.length) dns.setServers(env.mongo.dnsServers);
 
-/** Run a query, return all rows. */
-export async function query(sql, params = []) {
-  const [rows] = await pool.execute(sql, params);
-  return rows;
+mongoose.set('strictQuery', true);
+// Fail fast instead of buffering a query forever when the pool is down.
+mongoose.set('bufferCommands', false);
+
+export async function connectDatabase() {
+  await mongoose.connect(env.mongo.uri, {
+    dbName: env.mongo.dbName,
+    serverSelectionTimeoutMS: 15000,
+    maxPoolSize: 10,
+  });
+  return mongoose.connection;
 }
 
-/** Run a query, return the first row or null. */
-export async function queryOne(sql, params = []) {
-  const rows = await query(sql, params);
-  return rows.length ? rows[0] : null;
-}
-
-/** INSERT/UPDATE/DELETE — returns the raw ResultSetHeader. */
-export async function execute(sql, params = []) {
-  const [result] = await pool.execute(sql, params);
-  return result;
-}
-
-/** Run `fn` inside a transaction; rolls back on any throw. */
-export async function transaction(fn) {
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-    const result = await fn(conn);
-    await conn.commit();
-    return result;
-  } catch (err) {
-    await conn.rollback();
-    throw err;
-  } finally {
-    conn.release();
-  }
+export async function disconnectDatabase() {
+  await mongoose.disconnect();
 }
 
 export async function pingDatabase() {
-  const conn = await pool.getConnection();
+  if (mongoose.connection.readyState !== 1) throw new Error('Not connected');
+  await mongoose.connection.db.admin().command({ ping: 1 });
+}
+
+let transactionsUnsupported = false;
+
+/**
+ * Run `fn` inside a multi-document transaction.
+ *
+ * Atlas (a replica set) supports these. A standalone `mongod` does not, so the
+ * first such failure downgrades to running without a session — the writes still
+ * happen, just without all-or-nothing rollback. The warning is printed once.
+ */
+export async function withTransaction(fn) {
+  if (transactionsUnsupported) return fn(null);
+
+  const session = await mongoose.startSession();
   try {
-    await conn.ping();
+    let result;
+    await session.withTransaction(async () => {
+      result = await fn(session);
+    });
+    return result;
+  } catch (err) {
+    if (isTransactionUnsupported(err)) {
+      transactionsUnsupported = true;
+      console.warn(
+        'This MongoDB deployment does not support transactions (standalone server?) — ' +
+          'writes will run unbatched, without rollback. Use a replica set or Atlas for atomicity.',
+      );
+      return fn(null);
+    }
+    throw err;
   } finally {
-    conn.release();
+    await session.endSession();
   }
 }
+
+function isTransactionUnsupported(err) {
+  const message = String(err?.message ?? '');
+  return (
+    err?.code === 20 ||
+    err?.codeName === 'IllegalOperation' ||
+    message.includes('Transaction numbers are only allowed') ||
+    message.includes('replica set') ||
+    message.includes('transactions are not supported')
+  );
+}
+
+export { mongoose };

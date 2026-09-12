@@ -1,4 +1,5 @@
-import { daysInMonth, round2 } from '../utils/helpers.js';
+import { Attendance } from '../models/index.js';
+import { daysInMonth, monthFilter, round2 } from '../utils/helpers.js';
 
 /**
  * Salary engine shared by the seeder and the admin payroll-run endpoint.
@@ -16,7 +17,7 @@ export function computePayslip({ structure, month, year, lopDays = 0 }) {
     { label: 'Basic Salary', amount: round2(structure.basic * factor) },
     { label: 'House Rent Allowance', amount: round2(structure.hra * factor) },
     { label: 'Conveyance Allowance', amount: round2(structure.conveyance * factor) },
-    { label: 'Special Allowance', amount: round2(structure.special_allowance * factor) },
+    { label: 'Special Allowance', amount: round2(structure.specialAllowance * factor) },
   ].filter((c) => c.amount > 0);
 
   const gross = round2(earnings.reduce((sum, c) => sum + c.amount, 0));
@@ -70,18 +71,25 @@ function estimateMonthlyTds(monthlyGross) {
   return (tax * 1.04) / 12; // + 4% cess
 }
 
-/** LOP days for a month straight from the attendance table. */
-export async function countLopDays(conn, employeeId, month, year) {
-  const [rows] = await conn.execute(
-    `SELECT COALESCE(SUM(CASE WHEN status = 'half_day' THEN 0.5 ELSE 1 END), 0) AS lop
-       FROM attendance
-      WHERE employee_id = ?
-        AND MONTH(work_date) = ?
-        AND YEAR(work_date) = ?
-        AND status IN ('absent', 'miss_punch', 'half_day')`,
-    [employeeId, month, year],
-  );
-  return Number(rows[0]?.lop ?? 0);
+/** LOP days for a month straight from the attendance collection. */
+export async function countLopDays(employeeId, month, year, session = null) {
+  const pipeline = [
+    {
+      $match: {
+        employeeId,
+        workDate: monthFilter(month, year),
+        status: { $in: ['absent', 'miss_punch', 'half_day'] },
+      },
+    },
+    {
+      $group: {
+        _id: null,
+        lop: { $sum: { $cond: [{ $eq: ['$status', 'half_day'] }, 0.5, 1] } },
+      },
+    },
+  ];
+  const [row] = await Attendance.aggregate(pipeline).session(session);
+  return Number(row?.lop ?? 0);
 }
 
 export const MONTH_NAMES = [

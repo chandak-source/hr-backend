@@ -74,3 +74,49 @@ export const isWeekOff = (dateString) => {
 export const buildCode = (prefix, seq) => `${prefix}-${seq}`;
 
 export const round2 = (n) => Math.round(Number(n) * 100) / 100;
+
+/** Escape user input before putting it in a $regex — replaces SQL LIKE. */
+export const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** Case-insensitive "contains" filter across several fields. */
+export const searchFilter = (term, fields) => ({
+  $or: fields.map((f) => ({ [f]: { $regex: escapeRegex(term), $options: 'i' } })),
+});
+
+// ------------------------------------------------------- date-string ranges --
+// Calendar dates are stored as YYYY-MM-DD strings, which compare correctly with
+// $gte / $lte. These build the bounds that replaced MONTH() / DATE_SUB() in SQL.
+
+/** Inclusive first/last day of a month, as YYYY-MM-DD. */
+export const monthRange = (month, year) => {
+  const mm = String(month).padStart(2, '0');
+  return {
+    from: `${year}-${mm}-01`,
+    to: `${year}-${mm}-${String(daysInMonth(month, year)).padStart(2, '0')}`,
+  };
+};
+
+/** A `{ $gte, $lte }` filter for one calendar month. */
+export const monthFilter = (month, year) => {
+  const { from, to } = monthRange(month, year);
+  return { $gte: from, $lte: to };
+};
+
+/** YYYY-MM-DD for `n` days before today. */
+export const daysAgoString = (n) => {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return toDateString(d);
+};
+
+/** Inclusive list of YYYY-MM-DD strings between two dates (capped at a year). */
+export function eachDate(from, to) {
+  const dates = [];
+  const cursor = new Date(`${from}T00:00:00`);
+  const end = new Date(`${to}T00:00:00`);
+  while (cursor <= end && dates.length < 366) {
+    dates.push(toDateString(cursor));
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return dates;
+}

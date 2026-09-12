@@ -1,31 +1,31 @@
 import { createApp } from './app.js';
 import { env } from './config/env.js';
-import { pool, pingDatabase } from './config/db.js';
+import { connectDatabase, disconnectDatabase } from './config/db.js';
 
 const app = createApp();
 
-// Bind the port first so container health checks pass even while MySQL warms up;
-// `/health` reports the database separately.
+// Bind the port first so container health checks pass even while MongoDB is
+// still connecting; `/health` reports the database separately.
 const server = app.listen(env.port, () => {
   console.log(`Chanda HR API  →  http://localhost:${env.port}${env.apiPrefix}  [${env.nodeEnv}]`);
 });
 
 try {
-  await pingDatabase();
-  console.log(`MySQL connected  →  ${env.db.host}:${env.db.port}/${env.db.database}`);
+  const conn = await connectDatabase();
+  console.log(`MongoDB connected  →  ${conn.host}/${conn.name}`);
 } catch (err) {
-  console.error(`MySQL unreachable  →  ${err.message}`);
+  console.error(`MongoDB unreachable  →  ${err.message}`);
   console.error('API is up but every data route will fail until the database is reachable.');
 }
 
-/** Drain in-flight requests, close the pool, then exit. */
+/** Drain in-flight requests, close the connection, then exit. */
 async function shutdown(signal) {
   console.log(`${signal} received — shutting down`);
   server.close(async () => {
     try {
-      await pool.end();
+      await disconnectDatabase();
     } catch {
-      // pool already closed
+      // already closed
     }
     process.exit(0);
   });

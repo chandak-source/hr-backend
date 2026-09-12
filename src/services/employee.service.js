@@ -1,51 +1,93 @@
-import { queryOne } from '../config/db.js';
+import mongoose from 'mongoose';
 
-/** Columns shared by every "employee" shaped response. */
-export const EMPLOYEE_SELECT = `
-  e.id,
-  e.emp_code       AS empCode,
-  e.name,
-  e.email,
-  e.phone,
-  e.role,
-  e.designation,
-  e.status,
-  e.date_of_joining AS dateOfJoining,
-  e.pan,
-  e.uan,
-  e.bank_name       AS bankName,
-  e.bank_account    AS bankAccount,
-  d.name            AS department,
-  l.name            AS location,
-  m.name            AS reportingTo,
-  m.id              AS reportingToId,
-  CONCAT(s.name, ' • ', DATE_FORMAT(s.start_time, '%H:%i'), ' - ', DATE_FORMAT(s.end_time, '%H:%i')) AS shift
-`;
+import { Employee } from '../models/index.js';
 
-export const EMPLOYEE_JOINS = `
-  FROM employees e
-  LEFT JOIN departments d ON d.id = e.department_id
-  LEFT JOIN locations   l ON l.id = e.location_id
-  LEFT JOIN shifts      s ON s.id = e.shift_id
-  LEFT JOIN employees   m ON m.id = e.reporting_to
-`;
+/**
+ * The "employee shaped" response used by /auth/me, the directory and the admin
+ * employee list. This is the aggregation equivalent of the four LEFT JOINs the
+ * SQL build used (department, location, shift, reporting manager).
+ *
+ * `withPasswordHash` is only ever true for the login lookup.
+ */
+export const employeePipeline = ({ withPasswordHash = false } = {}) => [
+  { $lookup: { from: 'departments', localField: 'departmentId', foreignField: '_id', as: 'dept' } },
+  { $lookup: { from: 'locations', localField: 'locationId', foreignField: '_id', as: 'loc' } },
+  { $lookup: { from: 'shifts', localField: 'shiftId', foreignField: '_id', as: 'shft' } },
+  { $lookup: { from: 'employees', localField: 'reportingTo', foreignField: '_id', as: 'mgr' } },
+  {
+    $project: {
+      _id: 0,
+      id: { $toString: '$_id' },
+      empCode: 1,
+      name: 1,
+      email: 1,
+      phone: 1,
+      role: 1,
+      designation: 1,
+      status: 1,
+      dateOfJoining: 1,
+      pan: 1,
+      uan: 1,
+      bankName: 1,
+      bankAccount: 1,
+      ...(withPasswordHash ? { passwordHash: 1 } : {}),
+      department: { $ifNull: [{ $first: '$dept.name' }, null] },
+      location: { $ifNull: [{ $first: '$loc.name' }, null] },
+      reportingTo: { $ifNull: [{ $first: '$mgr.name' }, null] },
+      reportingToId: { $ifNull: [{ $toString: { $first: '$mgr._id' } }, null] },
+      // "General • 09:30 - 18:30"
+      shift: {
+        $let: {
+          vars: { s: { $first: '$shft' } },
+          in: {
+            $cond: [
+              { $ifNull: ['$$s', false] },
+              {
+                $concat: [
+                  '$$s.name',
+                  ' • ',
+                  { $substrBytes: ['$$s.startTime', 0, 5] },
+                  ' - ',
+                  { $substrBytes: ['$$s.endTime', 0, 5] },
+                ],
+              },
+              null,
+            ],
+          },
+        },
+      },
+    },
+  },
+];
 
-export function getEmployeeById(id) {
-  return queryOne(`SELECT ${EMPLOYEE_SELECT} ${EMPLOYEE_JOINS} WHERE e.id = ?`, [id]);
+/** Run the employee pipeline behind a `$match`, returning plain objects. */
+export async function findEmployees(match, { sort, limit, withPasswordHash } = {}) {
+  const pipeline = [{ $match: match }, ...employeePipeline({ withPasswordHash })];
+  if (sort) pipeline.push({ $sort: sort });
+  if (limit) pipeline.push({ $limit: limit });
+  return Employee.aggregate(pipeline);
 }
 
-export function getEmployeeByEmail(email) {
-  return queryOne(
-    `SELECT ${EMPLOYEE_SELECT}, e.password_hash AS passwordHash ${EMPLOYEE_JOINS} WHERE e.email = ?`,
-    [email],
-  );
+export async function getEmployeeById(id) {
+  if (!mongoose.isValidObjectId(id)) return null;
+  const [row] = await findEmployees({ _id: new mongoose.Types.ObjectId(String(id)) });
+  return row ?? null;
+}
+
+export async function getEmployeeByEmail(email) {
+  const [row] = await findEmployees({ email }, { withPasswordHash: true });
+  return row ?? null;
+}
+
+/** Resolve an emp_code to an _id, or null. */
+export async function idForEmpCode(empCode) {
+  const row = await Employee.findOne({ empCode }).select('_id').lean();
+  return row?._id ?? null;
 }
 
 /**
- * Ids a manager may act on: their direct reports (admins see everyone).
- * Returns null when the caller can see all employees.
+ * Who a request may act on: admins see everyone, managers only their direct
+ * reports. Returns a filter fragment to spread into a query.
  */
-export async function scopeForApprover(user) {
-  if (user.role === 'admin') return null;
-  return user.id;
-}
+export const reportingScope = (user) =>
+  user.role === 'admin' ? {} : { reportingTo: user._id };

@@ -6,7 +6,7 @@ import jwt from 'jsonwebtoken';
 import { z } from 'zod';
 
 import { env } from '../config/env.js';
-import { execute, queryOne } from '../config/db.js';
+import { Employee, RefreshToken } from '../models/index.js';
 import { authenticate } from '../middleware/auth.js';
 import { ApiError } from '../utils/ApiError.js';
 import { asyncHandler, ok, parseWith } from '../utils/helpers.js';
@@ -32,12 +32,9 @@ function signAccessToken(user) {
 
 async function issueRefreshToken(employeeId) {
   const token = crypto.randomBytes(32).toString('hex');
-  const expires = new Date();
-  expires.setDate(expires.getDate() + env.jwt.refreshDays);
-  await execute(
-    'INSERT INTO refresh_tokens (employee_id, token, expires_at) VALUES (?,?,?)',
-    [employeeId, token, expires.toISOString().slice(0, 19).replace('T', ' ')],
-  );
+  const expiresAt = new Date();
+  expiresAt.setDate(expiresAt.getDate() + env.jwt.refreshDays);
+  await RefreshToken.create({ employeeId, token, expiresAt });
   return token;
 }
 
@@ -74,17 +71,15 @@ router.post(
       req.body,
     );
 
-    const row = await queryOne(
-      `SELECT employee_id AS employeeId FROM refresh_tokens
-        WHERE token = ? AND revoked_at IS NULL AND expires_at > NOW()`,
-      [refreshToken],
-    );
+    // Rotate: the presented token is consumed whether or not it was valid.
+    const row = await RefreshToken.findOneAndUpdate(
+      { token: refreshToken, revokedAt: null, expiresAt: { $gt: new Date() } },
+      { revokedAt: new Date() },
+    ).lean();
     if (!row) throw ApiError.unauthorized('Refresh token is invalid or expired');
 
     const user = await getEmployeeById(row.employeeId);
     if (!user) throw ApiError.unauthorized('Account no longer exists');
-
-    await execute('UPDATE refresh_tokens SET revoked_at = NOW() WHERE token = ?', [refreshToken]);
 
     ok(res, {
       token: signAccessToken(user),
@@ -100,9 +95,9 @@ router.post(
   '/logout',
   authenticate,
   asyncHandler(async (req, res) => {
-    await execute(
-      'UPDATE refresh_tokens SET revoked_at = NOW() WHERE employee_id = ? AND revoked_at IS NULL',
-      [req.user.id],
+    await RefreshToken.updateMany(
+      { employeeId: req.user._id, revokedAt: null },
+      { revokedAt: new Date() },
     );
     ok(res, { message: 'Signed out' });
   }),
@@ -112,7 +107,7 @@ router.post(
 router.get(
   '/me',
   authenticate,
-  asyncHandler(async (req, res) => ok(res, await getEmployeeById(req.user.id))),
+  asyncHandler(async (req, res) => ok(res, await getEmployeeById(req.user._id))),
 );
 
 // POST /auth/change-password
@@ -122,19 +117,17 @@ router.post(
   asyncHandler(async (req, res) => {
     const { currentPassword, newPassword } = parseWith(changePasswordSchema, req.body);
 
-    const row = await queryOne('SELECT password_hash AS hash FROM employees WHERE id = ?', [
-      req.user.id,
-    ]);
-    const matches = await bcrypt.compare(currentPassword, row.hash);
+    const row = await Employee.findById(req.user._id).select('+passwordHash').lean();
+    const matches = await bcrypt.compare(currentPassword, row.passwordHash);
     if (!matches) throw ApiError.badRequest('Current password is incorrect');
 
-    await execute('UPDATE employees SET password_hash = ? WHERE id = ?', [
-      await bcrypt.hash(newPassword, 10),
-      req.user.id,
-    ]);
-    await execute(
-      'UPDATE refresh_tokens SET revoked_at = NOW() WHERE employee_id = ? AND revoked_at IS NULL',
-      [req.user.id],
+    await Employee.updateOne(
+      { _id: req.user._id },
+      { passwordHash: await bcrypt.hash(newPassword, 10) },
+    );
+    await RefreshToken.updateMany(
+      { employeeId: req.user._id, revokedAt: null },
+      { revokedAt: new Date() },
     );
 
     ok(res, { message: 'Password updated — please sign in again' });

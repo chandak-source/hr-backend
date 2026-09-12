@@ -1,13 +1,15 @@
 import { Router } from 'express';
 import { z } from 'zod';
 
-import { execute, query, queryOne } from '../config/db.js';
+import { Attendance, Employee, PunchLog, RegularizationRequest } from '../models/index.js';
 import { authenticate } from '../middleware/auth.js';
 import { ApiError } from '../utils/ApiError.js';
+import { nextCode } from '../services/sequence.service.js';
 import {
   asyncHandler,
   created,
   minutesBetween,
+  monthFilter,
   ok,
   parseWith,
   todayString,
@@ -17,17 +19,19 @@ import {
 const router = Router();
 router.use(authenticate);
 
-const ATTENDANCE_SELECT = `
-  a.id,
-  a.work_date     AS date,
-  a.punch_in      AS punchIn,
-  a.punch_out     AS punchOut,
-  a.total_minutes AS totalMinutes,
-  a.status,
-  a.work_mode     AS workMode,
-  a.in_location   AS inLocation,
-  a.is_regularized AS isRegularized
-`;
+/** The attendance row shape every endpoint here returns. */
+const toAttendance = (d) =>
+  d && {
+    id: d._id.toString(),
+    date: d.workDate,
+    punchIn: d.punchIn,
+    punchOut: d.punchOut,
+    totalMinutes: d.totalMinutes,
+    status: d.status,
+    workMode: d.workMode,
+    inLocation: d.inLocation,
+    isRegularized: d.isRegularized,
+  };
 
 const punchInSchema = z.object({
   workMode: z.enum(['office', 'wfh', 'client_site', 'on_duty']).default('office'),
@@ -49,15 +53,15 @@ const withSeconds = (t) => (t.length === 5 ? `${t}:00` : t);
 router.get(
   '/today',
   asyncHandler(async (req, res) => {
-    const row = await queryOne(
-      `SELECT ${ATTENDANCE_SELECT} FROM attendance a WHERE a.employee_id = ? AND a.work_date = ?`,
-      [req.user.id, todayString()],
-    );
+    const row = await Attendance.findOne({
+      employeeId: req.user._id,
+      workDate: todayString(),
+    }).lean();
 
     ok(res, {
       date: todayString(),
       isPunchedIn: Boolean(row?.punchIn && !row?.punchOut),
-      record: row,
+      record: toAttendance(row),
     });
   }),
 );
@@ -70,51 +74,41 @@ router.post(
     const date = todayString();
     const time = toTimeString();
 
-    const existing = await queryOne(
-      'SELECT id, punch_in AS punchIn, punch_out AS punchOut FROM attendance WHERE employee_id = ? AND work_date = ?',
-      [req.user.id, date],
-    );
+    const existing = await Attendance.findOne({ employeeId: req.user._id, workDate: date }).lean();
     if (existing?.punchIn && !existing?.punchOut) {
       throw ApiError.conflict('You are already punched in');
     }
 
-    const shift = await queryOne(
-      `SELECT s.start_time AS startTime, s.grace_minutes AS grace
-         FROM employees e LEFT JOIN shifts s ON s.id = e.shift_id WHERE e.id = ?`,
-      [req.user.id],
-    );
+    const employee = await Employee.findById(req.user._id).populate('shiftId').lean();
+    const shift = employee?.shiftId;
     const lateBy = shift?.startTime ? minutesBetween(shift.startTime, time) : 0;
-    const status = lateBy > (shift?.grace ?? 15) ? 'late_in' : 'present';
+    const status = lateBy > (shift?.graceMinutes ?? 15) ? 'late_in' : 'present';
 
-    if (existing) {
-      await execute(
-        `UPDATE attendance
-            SET punch_in = ?, punch_out = NULL, total_minutes = 0, status = ?,
-                work_mode = ?, in_location = ?
-          WHERE id = ?`,
-        [time, status, body.workMode, body.address ?? null, existing.id],
-      );
-    } else {
-      await execute(
-        `INSERT INTO attendance
-           (employee_id, work_date, punch_in, status, work_mode, in_location, shift_id)
-         VALUES (?,?,?,?,?,?,(SELECT shift_id FROM employees WHERE id = ?))`,
-        [req.user.id, date, time, status, body.workMode, body.address ?? null, req.user.id],
-      );
-    }
-
-    await execute(
-      `INSERT INTO punch_logs (employee_id, punched_at, punch_type, work_mode, latitude, longitude, address)
-       VALUES (?, ?, 'in', ?, ?, ?, ?)`,
-      [
-        req.user.id,
-        `${date} ${time}`,
-        body.workMode,
-        body.latitude ?? null,
-        body.longitude ?? null,
-        body.address ?? null,
-      ],
+    await Attendance.updateOne(
+      { employeeId: req.user._id, workDate: date },
+      {
+        $set: {
+          punchIn: time,
+          punchOut: null,
+          totalMinutes: 0,
+          status,
+          workMode: body.workMode,
+          inLocation: body.address ?? null,
+          shiftId: employee?.shiftId?._id ?? null,
+        },
+      },
+      { upsert: true },
     );
+
+    await PunchLog.create({
+      employeeId: req.user._id,
+      punchedAt: new Date(`${date}T${time}`),
+      punchType: 'in',
+      workMode: body.workMode,
+      latitude: body.latitude ?? null,
+      longitude: body.longitude ?? null,
+      address: body.address ?? null,
+    });
 
     created(res, { date, punchIn: time, status, workMode: body.workMode, lateByMinutes: lateBy });
   }),
@@ -127,25 +121,23 @@ router.post(
     const date = todayString();
     const time = toTimeString();
 
-    const row = await queryOne(
-      'SELECT id, punch_in AS punchIn, punch_out AS punchOut, status FROM attendance WHERE employee_id = ? AND work_date = ?',
-      [req.user.id, date],
-    );
+    const row = await Attendance.findOne({ employeeId: req.user._id, workDate: date }).lean();
     if (!row?.punchIn) throw ApiError.badRequest('Punch in first');
     if (row.punchOut) throw ApiError.conflict('You have already punched out today');
 
     const minutes = minutesBetween(row.punchIn, time);
     const status = minutes < 240 ? 'half_day' : row.status;
 
-    await execute(
-      'UPDATE attendance SET punch_out = ?, total_minutes = ?, status = ? WHERE id = ?',
-      [time, minutes, status, row.id],
+    await Attendance.updateOne(
+      { _id: row._id },
+      { $set: { punchOut: time, totalMinutes: minutes, status } },
     );
-    await execute(
-      `INSERT INTO punch_logs (employee_id, punched_at, punch_type, work_mode)
-       VALUES (?, ?, 'out', (SELECT work_mode FROM attendance WHERE id = ?))`,
-      [req.user.id, `${date} ${time}`, row.id],
-    );
+    await PunchLog.create({
+      employeeId: req.user._id,
+      punchedAt: new Date(`${date}T${time}`),
+      punchType: 'out',
+      workMode: row.workMode ?? 'office',
+    });
 
     ok(res, {
       date,
@@ -172,20 +164,14 @@ router.get(
       req.query,
     );
 
-    const where = ['a.employee_id = ?'];
-    const params = [req.user.id];
-    if (from) { where.push('a.work_date >= ?'); params.push(from); }
-    if (to) { where.push('a.work_date <= ?'); params.push(to); }
-    if (status) { where.push('a.status = ?'); params.push(status); }
+    const filter = { employeeId: req.user._id };
+    if (from || to) {
+      filter.workDate = { ...(from ? { $gte: from } : {}), ...(to ? { $lte: to } : {}) };
+    }
+    if (status) filter.status = status;
 
-    const rows = await query(
-      `SELECT ${ATTENDANCE_SELECT} FROM attendance a
-        WHERE ${where.join(' AND ')}
-        ORDER BY a.work_date DESC
-        LIMIT ${limit}`,
-      params,
-    );
-    ok(res, rows, { count: rows.length });
+    const rows = await Attendance.find(filter).sort({ workDate: -1 }).limit(limit).lean();
+    ok(res, rows.map(toAttendance), { count: rows.length });
   }),
 );
 
@@ -202,15 +188,12 @@ router.get(
       req.query,
     );
 
-    const rows = await query(
-      `SELECT status, COUNT(*) AS total, COALESCE(SUM(total_minutes), 0) AS minutes
-         FROM attendance
-        WHERE employee_id = ? AND MONTH(work_date) = ? AND YEAR(work_date) = ?
-        GROUP BY status`,
-      [req.user.id, month, year],
-    );
+    const rows = await Attendance.aggregate([
+      { $match: { employeeId: req.user._id, workDate: monthFilter(month, year) } },
+      { $group: { _id: '$status', total: { $sum: 1 }, minutes: { $sum: '$totalMinutes' } } },
+    ]);
 
-    const byStatus = Object.fromEntries(rows.map((r) => [r.status, Number(r.total)]));
+    const byStatus = Object.fromEntries(rows.map((r) => [r._id, r.total]));
     const workedMinutes = rows.reduce((s, r) => s + Number(r.minutes), 0);
     const workedDays = (byStatus.present ?? 0) + (byStatus.late_in ?? 0) + (byStatus.half_day ?? 0);
     const present = (byStatus.present ?? 0) + (byStatus.late_in ?? 0);
@@ -253,13 +236,14 @@ router.get(
       req.query,
     );
 
-    const rows = await query(
-      `SELECT ${ATTENDANCE_SELECT} FROM attendance a
-        WHERE a.employee_id = ? AND MONTH(a.work_date) = ? AND YEAR(a.work_date) = ?
-        ORDER BY a.work_date`,
-      [req.user.id, month, year],
-    );
-    ok(res, rows, { month, year, count: rows.length });
+    const rows = await Attendance.find({
+      employeeId: req.user._id,
+      workDate: monthFilter(month, year),
+    })
+      .sort({ workDate: 1 })
+      .lean();
+
+    ok(res, rows.map(toAttendance), { month, year, count: rows.length });
   }),
 );
 
@@ -267,17 +251,25 @@ router.get(
 router.get(
   '/regularizations',
   asyncHandler(async (req, res) => {
-    const rows = await query(
-      `SELECT r.id, r.request_code AS code, r.work_date AS date, r.punch_in AS punchIn,
-              r.punch_out AS punchOut, r.reason, r.status, r.created_at AS createdAt,
-              a.name AS approver
-         FROM regularization_requests r
-         LEFT JOIN employees a ON a.id = r.approver_id
-        WHERE r.employee_id = ?
-        ORDER BY r.created_at DESC`,
-      [req.user.id],
+    const rows = await RegularizationRequest.find({ employeeId: req.user._id })
+      .sort({ createdAt: -1 })
+      .populate('approverId', 'name')
+      .lean();
+
+    ok(
+      res,
+      rows.map((r) => ({
+        id: r._id.toString(),
+        code: r.requestCode,
+        date: r.workDate,
+        punchIn: r.punchIn,
+        punchOut: r.punchOut,
+        reason: r.reason,
+        status: r.status,
+        createdAt: r.createdAt,
+        approver: r.approverId?.name ?? null,
+      })),
     );
-    ok(res, rows);
   }),
 );
 
@@ -286,32 +278,24 @@ router.post(
   asyncHandler(async (req, res) => {
     const body = parseWith(regularizeSchema, req.body);
 
-    const duplicate = await queryOne(
-      `SELECT id FROM regularization_requests
-        WHERE employee_id = ? AND work_date = ? AND status = 'pending'`,
-      [req.user.id, body.date],
-    );
+    const duplicate = await RegularizationRequest.exists({
+      employeeId: req.user._id,
+      workDate: body.date,
+      status: 'pending',
+    });
     if (duplicate) throw ApiError.conflict('A pending request already exists for this date');
 
-    const seq = await queryOne('SELECT COUNT(*) AS n FROM regularization_requests');
-    const code = `RG-${312 + Number(seq.n)}`;
+    const doc = await RegularizationRequest.create({
+      requestCode: await nextCode('RG-', 'regularization'),
+      employeeId: req.user._id,
+      workDate: body.date,
+      punchIn: withSeconds(body.punchIn),
+      punchOut: withSeconds(body.punchOut),
+      reason: body.reason,
+      approverId: req.user.reportingTo ?? null,
+    });
 
-    const result = await execute(
-      `INSERT INTO regularization_requests
-         (request_code, employee_id, work_date, punch_in, punch_out, reason, approver_id)
-       VALUES (?,?,?,?,?,?,(SELECT reporting_to FROM employees WHERE id = ?))`,
-      [
-        code,
-        req.user.id,
-        body.date,
-        withSeconds(body.punchIn),
-        withSeconds(body.punchOut),
-        body.reason,
-        req.user.id,
-      ],
-    );
-
-    created(res, { id: result.insertId, code, status: 'pending', ...body });
+    created(res, { id: doc.id, code: doc.requestCode, status: doc.status, ...body });
   }),
 );
 

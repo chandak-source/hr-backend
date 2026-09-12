@@ -1,9 +1,11 @@
 import { Router } from 'express';
 import { z } from 'zod';
 
-import { execute, query, queryOne, transaction } from '../config/db.js';
+import { withTransaction } from '../config/db.js';
+import { LeaveBalance, LeaveRequest, LeaveType, Notification } from '../models/index.js';
 import { authenticate } from '../middleware/auth.js';
 import { ApiError } from '../utils/ApiError.js';
+import { nextCode } from '../services/sequence.service.js';
 import {
   asyncHandler,
   created,
@@ -17,32 +19,33 @@ import {
 const router = Router();
 router.use(authenticate);
 
-const LEAVE_SELECT = `
-  lr.id,
-  lr.request_code AS code,
-  lr.from_date    AS fromDate,
-  lr.to_date      AS toDate,
-  lr.day_type     AS dayType,
-  lr.days,
-  lr.reason,
-  lr.status,
-  lr.applied_on   AS appliedOn,
-  lr.action_on    AS actionOn,
-  lr.action_remark AS actionRemark,
-  lt.name         AS leaveType,
-  lt.code         AS leaveTypeCode,
-  lt.color_hex    AS color,
-  e.name          AS employeeName,
-  e.emp_code      AS employeeCode,
-  ap.name         AS approver
-`;
+const POPULATE = [
+  { path: 'leaveTypeId', select: 'name code color' },
+  { path: 'employeeId', select: 'name empCode' },
+  { path: 'approverId', select: 'name' },
+];
 
-const LEAVE_JOINS = `
-  FROM leave_requests lr
-  JOIN leave_types lt ON lt.id = lr.leave_type_id
-  JOIN employees   e  ON e.id  = lr.employee_id
-  LEFT JOIN employees ap ON ap.id = lr.approver_id
-`;
+/** Flattens the populated refs into the response shape the SQL joins produced. */
+const toLeave = (r) =>
+  r && {
+    id: r._id.toString(),
+    code: r.requestCode,
+    fromDate: r.fromDate,
+    toDate: r.toDate,
+    dayType: r.dayType,
+    days: r.days,
+    reason: r.reason,
+    status: r.status,
+    appliedOn: r.appliedOn,
+    actionOn: r.actionOn,
+    actionRemark: r.actionRemark,
+    leaveType: r.leaveTypeId?.name ?? null,
+    leaveTypeCode: r.leaveTypeId?.code ?? null,
+    color: r.leaveTypeId?.color ?? null,
+    employeeName: r.employeeId?.name ?? null,
+    employeeCode: r.employeeId?.empCode ?? null,
+    approver: r.approverId?.name ?? null,
+  };
 
 const applySchema = z
   .object({
@@ -65,12 +68,19 @@ const applySchema = z
 router.get(
   '/types',
   asyncHandler(async (_req, res) => {
-    const rows = await query(
-      `SELECT id, code, name, annual_quota AS annualQuota, is_paid AS isPaid,
-              requires_proof AS requiresProof, color_hex AS color
-         FROM leave_types WHERE is_active = 1 ORDER BY id`,
+    const rows = await LeaveType.find({ isActive: true }).sort({ sortOrder: 1 }).lean();
+    ok(
+      res,
+      rows.map((t) => ({
+        id: t._id.toString(),
+        code: t.code,
+        name: t.name,
+        annualQuota: t.annualQuota,
+        isPaid: t.isPaid,
+        requiresProof: t.requiresProof,
+        color: t.color,
+      })),
     );
-    ok(res, rows);
   }),
 );
 
@@ -79,18 +89,23 @@ router.get(
   '/balances',
   asyncHandler(async (req, res) => {
     const fy = req.query.financialYear ?? financialYearOf();
-    const rows = await query(
-      `SELECT lt.code AS shortCode, lt.name AS type, lt.color_hex AS color,
-              lb.allotted + lb.carried_forward AS total,
-              lb.used,
-              (lb.allotted + lb.carried_forward - lb.used) AS available
-         FROM leave_balances lb
-         JOIN leave_types lt ON lt.id = lb.leave_type_id
-        WHERE lb.employee_id = ? AND lb.financial_year = ?
-        ORDER BY lt.id`,
-      [req.user.id, fy],
-    );
-    ok(res, rows, { financialYear: fy });
+    const rows = await LeaveBalance.find({ employeeId: req.user._id, financialYear: fy })
+      .populate('leaveTypeId', 'name code color sortOrder')
+      .lean();
+
+    const balances = rows
+      .filter((b) => b.leaveTypeId)
+      .sort((a, b) => (a.leaveTypeId.sortOrder ?? 0) - (b.leaveTypeId.sortOrder ?? 0))
+      .map((b) => ({
+        shortCode: b.leaveTypeId.code,
+        type: b.leaveTypeId.name,
+        color: b.leaveTypeId.color,
+        total: b.allotted + b.carriedForward,
+        used: b.used,
+        available: b.allotted + b.carriedForward - b.used,
+      }));
+
+    ok(res, balances, { financialYear: fy });
   }),
 );
 
@@ -103,15 +118,11 @@ router.get(
       req.query,
     );
 
-    const where = ['lr.employee_id = ?'];
-    const params = [req.user.id];
-    if (status) { where.push('lr.status = ?'); params.push(status); }
+    const filter = { employeeId: req.user._id };
+    if (status) filter.status = status;
 
-    const rows = await query(
-      `SELECT ${LEAVE_SELECT} ${LEAVE_JOINS} WHERE ${where.join(' AND ')} ORDER BY lr.created_at DESC`,
-      params,
-    );
-    ok(res, rows, { count: rows.length });
+    const rows = await LeaveRequest.find(filter).sort({ createdAt: -1 }).populate(POPULATE).lean();
+    ok(res, rows.map(toLeave), { count: rows.length });
   }),
 );
 
@@ -122,77 +133,77 @@ router.post(
     const body = parseWith(applySchema, req.body);
     const fy = financialYearOf(body.fromDate);
 
-    const type = await queryOne('SELECT id, name, annual_quota AS quota FROM leave_types WHERE code = ? AND is_active = 1', [
-      body.leaveTypeCode,
-    ]);
+    const type = await LeaveType.findOne({ code: body.leaveTypeCode, isActive: true }).lean();
     if (!type) throw ApiError.badRequest(`Unknown leave type "${body.leaveTypeCode}"`);
 
     const days =
       body.dayType === 'full_day' ? daysBetweenInclusive(body.fromDate, body.toDate) : 0.5;
 
-    const overlap = await queryOne(
-      `SELECT request_code AS code FROM leave_requests
-        WHERE employee_id = ? AND status IN ('pending','approved')
-          AND from_date <= ? AND to_date >= ?`,
-      [req.user.id, body.toDate, body.fromDate],
-    );
-    if (overlap) throw ApiError.conflict(`Overlaps with existing request ${overlap.code}`);
+    // Two ranges overlap when each starts on or before the other ends.
+    const overlap = await LeaveRequest.findOne({
+      employeeId: req.user._id,
+      status: { $in: ['pending', 'approved'] },
+      fromDate: { $lte: body.toDate },
+      toDate: { $gte: body.fromDate },
+    })
+      .select('requestCode')
+      .lean();
+    if (overlap) throw ApiError.conflict(`Overlaps with existing request ${overlap.requestCode}`);
 
-    const result = await transaction(async (conn) => {
-      if (Number(type.quota) > 0) {
-        const [balRows] = await conn.execute(
-          `SELECT id, (allotted + carried_forward - used) AS available
-             FROM leave_balances
-            WHERE employee_id = ? AND leave_type_id = ? AND financial_year = ?
-            FOR UPDATE`,
-          [req.user.id, type.id, fy],
-        );
-        const balance = balRows[0];
+    const requestId = await withTransaction(async (session) => {
+      if (Number(type.annualQuota) > 0) {
+        const balance = await LeaveBalance.findOne({
+          employeeId: req.user._id,
+          leaveTypeId: type._id,
+          financialYear: fy,
+        })
+          .session(session)
+          .lean();
+
         if (!balance) throw ApiError.badRequest(`No ${type.name} balance allotted for ${fy}`);
-        if (Number(balance.available) < days) {
-          throw ApiError.badRequest(
-            `Only ${balance.available} day(s) of ${type.name} available`,
-          );
+        const available = balance.allotted + balance.carriedForward - balance.used;
+        if (available < days) {
+          throw ApiError.badRequest(`Only ${available} day(s) of ${type.name} available`);
         }
       }
 
-      const [seq] = await conn.query('SELECT COUNT(*) AS n FROM leave_requests');
-      const code = `LV-${2310 + Number(seq[0].n)}`;
-
-      const [insert] = await conn.execute(
-        `INSERT INTO leave_requests
-           (request_code, employee_id, leave_type_id, from_date, to_date, day_type, days,
-            reason, applied_on, approver_id)
-         VALUES (?,?,?,?,?,?,?,?,?,(SELECT reporting_to FROM employees WHERE id = ?))`,
+      const [doc] = await LeaveRequest.create(
         [
-          code,
-          req.user.id,
-          type.id,
-          body.fromDate,
-          body.toDate,
-          body.dayType,
-          days,
-          body.reason,
-          todayString(),
-          req.user.id,
+          {
+            requestCode: await nextCode('LV-', 'leaveRequest', session),
+            employeeId: req.user._id,
+            leaveTypeId: type._id,
+            fromDate: body.fromDate,
+            toDate: body.toDate,
+            dayType: body.dayType,
+            days,
+            reason: body.reason,
+            appliedOn: todayString(),
+            approverId: req.user.reportingTo ?? null,
+          },
         ],
+        { session },
       );
 
-      await conn.execute(
-        `INSERT INTO notifications (employee_id, title, subtitle, kind)
-         SELECT reporting_to, 'New leave request',
-                CONCAT(?, ' applied for ', ?, ' day(s) of ', ?), 'leave'
-           FROM employees WHERE id = ? AND reporting_to IS NOT NULL`,
-        [req.user.name, days, type.name, req.user.id],
-      );
+      if (req.user.reportingTo) {
+        await Notification.create(
+          [
+            {
+              employeeId: req.user.reportingTo,
+              title: 'New leave request',
+              subtitle: `${req.user.name} applied for ${days} day(s) of ${type.name}`,
+              kind: 'leave',
+            },
+          ],
+          { session },
+        );
+      }
 
-      return { id: insert.insertId, code };
+      return doc._id;
     });
 
-    const request = await queryOne(`SELECT ${LEAVE_SELECT} ${LEAVE_JOINS} WHERE lr.id = ?`, [
-      result.id,
-    ]);
-    created(res, request);
+    const request = await LeaveRequest.findById(requestId).populate(POPULATE).lean();
+    created(res, toLeave(request));
   }),
 );
 
@@ -200,19 +211,21 @@ router.post(
 router.post(
   '/requests/:id/cancel',
   asyncHandler(async (req, res) => {
-    const row = await queryOne(
-      'SELECT id, status FROM leave_requests WHERE id = ? AND employee_id = ?',
-      [req.params.id, req.user.id],
-    );
+    const row = await LeaveRequest.findOne({
+      _id: req.params.id,
+      employeeId: req.user._id,
+    }).lean();
     if (!row) throw ApiError.notFound('Leave request not found');
     if (row.status !== 'pending') {
       throw ApiError.badRequest(`Only pending requests can be cancelled (this one is ${row.status})`);
     }
 
-    await execute("UPDATE leave_requests SET status = 'cancelled', action_on = NOW() WHERE id = ?", [
-      row.id,
-    ]);
-    ok(res, await queryOne(`SELECT ${LEAVE_SELECT} ${LEAVE_JOINS} WHERE lr.id = ?`, [row.id]));
+    await LeaveRequest.updateOne(
+      { _id: row._id },
+      { $set: { status: 'cancelled', actionOn: new Date() } },
+    );
+
+    ok(res, toLeave(await LeaveRequest.findById(row._id).populate(POPULATE).lean()));
   }),
 );
 

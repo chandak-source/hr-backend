@@ -11,24 +11,31 @@ export const errorHandler = (err, _req, res, _next) => {
   let message = err.message ?? 'Something went wrong';
   let details = err.details;
 
-  // Translate common MySQL faults into clean API errors.
-  switch (err.code) {
-    case 'ER_DUP_ENTRY':
-      status = 409;
-      message = 'A record with these details already exists';
-      break;
-    case 'ER_NO_REFERENCED_ROW_2':
-    case 'ER_ROW_IS_REFERENCED_2':
-      status = 422;
-      message = 'Referenced record does not exist';
-      break;
-    case 'ECONNREFUSED':
-    case 'ER_ACCESS_DENIED_ERROR':
-      status = 503;
-      message = 'Database is unreachable';
-      break;
-    default:
-      break;
+  // Translate common MongoDB / mongoose faults into clean API errors.
+  if (err.code === 11000) {
+    // Duplicate key — name the field so the client can point at it.
+    status = 409;
+    const field = Object.keys(err.keyPattern ?? {}).join(', ');
+    message = field
+      ? `A record with this ${field} already exists`
+      : 'A record with these details already exists';
+  } else if (err.name === 'ValidationError') {
+    status = 422;
+    message = 'Validation failed';
+    details = Object.values(err.errors ?? {}).map((e) => ({
+      field: e.path,
+      message: e.message,
+    }));
+  } else if (err.name === 'CastError') {
+    status = 400;
+    message = `Invalid ${err.path}: ${err.value}`;
+  } else if (
+    err.name === 'MongooseServerSelectionError' ||
+    err.name === 'MongoNetworkError' ||
+    err.code === 'ECONNREFUSED'
+  ) {
+    status = 503;
+    message = 'Database is unreachable';
   }
 
   if (status >= 500 && !err.expected) {
