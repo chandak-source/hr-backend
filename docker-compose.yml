@@ -1,0 +1,15 @@
+# Runs the API against the MongoDB Atlas cluster named in .env.
+#   docker compose up --build
+services:
+  api:
+    build: .
+    image: hr-backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      # Container DNS resolves SRV records fine — don't let the Windows-only
+      # workaround in .env follow the app into the image.
+      DNS_SERVERS: ""
+    ports:
+      - "${PORT:-4000}:4000"

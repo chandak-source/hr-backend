@@ -1,0 +1,21 @@
+# Never bake secrets or the host's node_modules into the image.
+.env
+.env.*
+node_modules
+
+.git
+.gitignore
+.github
+.idea
+.vscode
+
+Dockerfile
+.dockerignore
+docker-compose.yml
+render.yaml
+README.md
+.node-version
+
+*.log
+npm-debug.log*
+coverage

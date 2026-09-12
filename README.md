@@ -127,6 +127,44 @@ src/
 scripts/              smoke.js, verify-writes.js
 ```
 
+## Docker
+
+```bash
+docker compose up --build          # reads .env, serves on :4000
+```
+
+Or without compose:
+
+```bash
+docker build -t hr-backend .
+docker run --rm -p 4000:4000 --env-file .env -e DNS_SERVERS= hr-backend
+```
+
+`-e DNS_SERVERS=` is worth keeping: container DNS resolves SRV records fine, and
+the Windows-only workaround in `.env` shouldn't follow the app into the image
+(`docker-compose.yml` clears it for you).
+
+The image is `node:22-alpine`, multi-stage so only production `node_modules`
+ship, runs as the unprivileged `node` user, and uses `tini` as PID 1 so
+`docker stop` reaches the `SIGTERM` handler in `src/server.js`. Its `HEALTHCHECK`
+hits `/health/live`, not `/health` — a readiness probe would mark the container
+unhealthy and restart it every time MongoDB blipped.
+
+`.dockerignore` keeps `.env` and the host's `node_modules` out of the image;
+don't remove those two lines.
+
+One-off commands against the same image:
+
+```bash
+# These talk to Atlas directly, so a throwaway container is fine.
+docker compose run --rm api npm run db:migrate
+docker compose run --rm api npm run db:seed
+
+# The smoke test talks to the API over HTTP — run it inside the live container,
+# where localhost:4000 is the server.
+docker compose exec api npm run smoke
+```
+
 ## Deploy — Render + MongoDB Atlas
 
 `render.yaml` is a Render Blueprint.
