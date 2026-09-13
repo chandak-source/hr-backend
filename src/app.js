@@ -30,8 +30,19 @@ export function createApp() {
     rateLimit({ windowMs: 15 * 60 * 1000, limit: 50, standardHeaders: 'draft-8' }),
   );
 
+  // Hitting the bare host should say what this is, not read as a 404.
+  app.get('/', (_req, res) =>
+    res.json({
+      service: 'chanda-hr-api',
+      status: 'ok',
+      api: env.apiPrefix,
+      health: '/health',
+      repository: 'https://github.com/chandak-source/hr-backend',
+    }),
+  );
+
   // Liveness — is the process up? Never touches the database, so a platform
-  // health check won't restart the service over a transient MySQL blip.
+  // health check won't restart the service over a transient MongoDB blip.
   app.get('/health/live', (_req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
 
   // Readiness — can we actually serve data?
