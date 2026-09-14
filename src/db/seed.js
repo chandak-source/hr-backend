@@ -116,11 +116,37 @@ function requireBootstrapConfig() {
   }
 }
 
+/**
+ * Seeding wipes every collection, so on a database people are already using it
+ * destroys real accounts — and the accounts it destroys are exactly the ones
+ * somebody is about to try to sign in with. Refuse unless told explicitly.
+ *
+ * The bootstrap admin does not count: it is this script's own output, so
+ * re-seeding a database that only holds it is the intended repeatable case.
+ */
+async function assertSafeToWipe() {
+  if (process.argv.includes('--force')) return;
+
+  const realAccounts = await Employee.countDocuments({
+    email: { $ne: env.bootstrapAdmin.email },
+  });
+  if (realAccounts === 0) return;
+
+  throw new Error(
+    `${realAccounts} account(s) exist that this seeder did not create.\n` +
+      '  Seeding deletes every employee, their attendance, leave and payslips.\n' +
+      '  Re-run with --force if you really mean to erase them:\n' +
+      '      npm run db:seed -- --force',
+  );
+}
+
 async function seed() {
   requireBootstrapConfig();
 
   const conn = await connectDatabase();
   console.log(`• connected to ${conn.host}/${conn.name}`);
+
+  await assertSafeToWipe();
 
   console.log('• clearing existing data');
   await Promise.all(

@@ -183,19 +183,39 @@ for (const role of ['employee', 'manager', 'admin']) {
     must(status === 201, `got ${status} ${JSON.stringify(json)}`);
     must(json.data.token, 'no token returned');
     must(json.data.user.role === role, `role ${json.data.user.role}`);
-    signedUp[role] = email;
+    signedUp[role] = { email, user: json.data.user };
   });
 }
 
 await check('the signed-up role survives a fresh sign-in', async () => {
-  for (const [role, email] of Object.entries(signedUp)) {
+  for (const [role, { email }] of Object.entries(signedUp)) {
     const session = await login(email, 'test@12345');
     must(session.user.role === role, `${email} came back as ${session.user.role}`);
   }
 });
 
+// The app maps both responses with the same Api.user(), so a field that exists
+// on one path and not the other breaks the client rather than the server.
+await check('signup and login describe the account identically', async () => {
+  for (const [role, { email, user: fromSignup }] of Object.entries(signedUp)) {
+    const { user: fromLogin } = await login(email, 'test@12345');
+
+    const signupKeys = Object.keys(fromSignup).sort().join(',');
+    const loginKeys = Object.keys(fromLogin).sort().join(',');
+    must(signupKeys === loginKeys, `${role}: ${signupKeys} vs ${loginKeys}`);
+
+    for (const field of ['id', 'empCode', 'email', 'role', 'status']) {
+      must(
+        fromSignup[field] === fromLogin[field],
+        `${role}.${field}: ${fromSignup[field]} vs ${fromLogin[field]}`,
+      );
+    }
+    must(!('passwordHash' in fromLogin), `${role}: login leaked passwordHash`);
+  }
+});
+
 await check('a signed-up employee still cannot reach admin endpoints', async () => {
-  const session = await login(signedUp.employee, 'test@12345');
+  const session = await login(signedUp.employee.email, 'test@12345');
   const { status } = await call('GET', '/admin/overview', { token: session.token });
   must(status === 403, `got ${status}`);
 });
@@ -204,7 +224,7 @@ await check('signup refuses a duplicate email', async () => {
   const { status } = await call('POST', '/auth/signup', {
     body: {
       name: 'Duplicate',
-      email: signedUp.employee,
+      email: signedUp.employee.email,
       password: 'test@12345',
       role: 'employee',
       designation: 'Engineer',
