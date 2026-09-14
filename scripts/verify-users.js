@@ -31,7 +31,7 @@ const must = (c, m) => {
   if (!c) throw new Error(m);
 };
 
-const login = async (email, password) => {
+const login = async (email, password = process.env.SEED_PASSWORD ?? 'demo@1234') => {
   const { status, json } = await call('POST', '/auth/login', { body: { email, password } });
   if (status !== 200) throw new Error(`login ${email} → ${status} ${JSON.stringify(json)}`);
   return json.data;
@@ -55,10 +55,12 @@ await check('bootstrap admin can sign in and is an admin', () => {
   must(admin.user.role === 'admin', `role is ${admin.user.role}`);
   must(admin.user.empCode.startsWith('ADM'), `code ${admin.user.empCode}`);
 });
-await check('it is the only account in the system', async () => {
+await check('the bootstrap admin is the only pre-seeded account', async () => {
   const { json } = await call('GET', '/admin/employees', { token: admin.token });
-  must(json.data.length === 1, `${json.data.length} accounts exist`);
-  must(json.data[0].email === process.env.BOOTSTRAP_ADMIN_EMAIL, json.data[0].email);
+  const bootstrap = json.data.filter((u) => u.email === process.env.BOOTSTRAP_ADMIN_EMAIL);
+  must(bootstrap.length === 1, `bootstrap admin appears ${bootstrap.length} times`);
+  // Anything else present was created by this script or the app — never by the seeder.
+  must(json.data.every((u) => u.email.endsWith('@superaip.com')), 'an off-domain account exists');
 });
 
 console.log('\nemail domain validation');
@@ -120,6 +122,85 @@ await check('a new employee gets leave balances and attendance', async () => {
   const log = await call('GET', '/attendance/log', { token: session.token });
   must(log.json.data.length > 0, 'no attendance backfilled');
 });
+
+console.log('\nself-service signup');
+const signupStamp = Date.now();
+const signedUp = {};
+
+for (const bad of ['someone@gmail.com', 'someone@superaip.com.evil.com', 'nope']) {
+  await check(`signup rejects "${bad}"`, async () => {
+    const { status, json } = await call('POST', '/auth/signup', {
+      body: {
+        name: 'Should Not Exist',
+        email: bad,
+        password: 'test@12345',
+        role: 'employee',
+        designation: 'Engineer',
+      },
+    });
+    must(status === 422 || status === 400, `got ${status}`);
+    must(/superaip\.com|valid email/i.test(JSON.stringify(json)), 'unhelpful message');
+  });
+}
+
+await check('signup rejects a short password', async () => {
+  const { status } = await call('POST', '/auth/signup', {
+    body: {
+      name: 'Weak Password',
+      email: `qa.weak.${signupStamp}@superaip.com`,
+      password: 'abc',
+      role: 'employee',
+      designation: 'Engineer',
+    },
+  });
+  must(status === 422, `got ${status}`);
+});
+
+for (const role of ['employee', 'manager', 'admin']) {
+  await check(`signup registers a ${role} and signs them in`, async () => {
+    const email = `qa.signup.${role}.${signupStamp}@superaip.com`;
+    const { status, json } = await call('POST', '/auth/signup', {
+      body: {
+        name: `Signup ${role}`,
+        email,
+        password: 'test@12345',
+        role,
+        designation: 'QA Engineer',
+      },
+    });
+    must(status === 201, `got ${status} ${JSON.stringify(json)}`);
+    must(json.data.token, 'no token returned');
+    must(json.data.user.role === role, `role ${json.data.user.role}`);
+    signedUp[role] = email;
+  });
+}
+
+await check('the signed-up role survives a fresh sign-in', async () => {
+  for (const [role, email] of Object.entries(signedUp)) {
+    const session = await login(email, 'test@12345');
+    must(session.user.role === role, `${email} came back as ${session.user.role}`);
+  }
+});
+
+await check('a signed-up employee still cannot reach admin endpoints', async () => {
+  const session = await login(signedUp.employee, 'test@12345');
+  const { status } = await call('GET', '/admin/overview', { token: session.token });
+  must(status === 403, `got ${status}`);
+});
+
+await check('signup refuses a duplicate email', async () => {
+  const { status } = await call('POST', '/auth/signup', {
+    body: {
+      name: 'Duplicate',
+      email: signedUp.employee,
+      password: 'test@12345',
+      role: 'employee',
+      designation: 'Engineer',
+    },
+  });
+  must(status === 409, `got ${status}`);
+});
+
 
 console.log('\nrole enforcement still holds');
 await check('an employee cannot reach admin endpoints', async () => {

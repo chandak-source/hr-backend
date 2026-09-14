@@ -23,6 +23,13 @@ import { nextSequence } from './sequence.service.js';
 /** How much attendance history a freshly created employee starts with. */
 const BACKFILL_DAYS = 30;
 
+/**
+ * CTC given to self-registered accounts. Payroll needs a salary structure to
+ * exist, but a user must not get to declare their own pay — an admin corrects
+ * this from the employee record.
+ */
+export const SIGNUP_DEFAULT_CTC = 600000;
+
 const CODE_PREFIX = { admin: 'ADM', manager: 'MGR', employee: 'EMP' };
 
 /**

@@ -25,9 +25,21 @@ BOOTSTRAP_ADMIN_EMAIL=admin@superaip.com
 BOOTSTRAP_ADMIN_PASSWORD=<a long random string>
 ```
 
-Every other account — Employee, Manager or Admin — is created by signing in as
-that admin and using **Employees → Add** in the app, which posts to
-`POST /admin/employees`.
+Other accounts come from one of two places, both dynamic:
+
+- **Sign up** (`POST /auth/signup`) — open self-registration from the app's
+  login screen. The caller picks their own role and is signed straight in.
+- **Create User** (`POST /admin/employees`) — an admin adds someone from
+  **Employees → Add**, and can set their department, manager and CTC.
+
+> **Signup grants the role the caller asks for.** Anyone with a company address
+> can register as an admin and read everyone's payroll. If that isn't wanted,
+> the smallest fix is to create signup accounts with `status: 'on_notice'` and
+> have `authenticate` refuse them until an admin activates the record.
+
+Self-registered accounts get no department and a placeholder CTC
+(`SIGNUP_DEFAULT_CTC`) — a user must not set their own pay — so an admin should
+complete the record afterwards.
 
 **Email domain is enforced.** An account may only be created under
 `ALLOWED_EMAIL_DOMAIN` (`@superaip.com`); anything else is refused with a
@@ -88,11 +100,11 @@ local-machine workaround; leave it empty in production.
 ## API
 
 All routes are under `API_PREFIX` and need `Authorization: Bearer <token>`
-except `/auth/login`, `/auth/refresh` and the health endpoints.
+except `/auth/signup`, `/auth/login`, `/auth/refresh` and the health endpoints.
 
 | Group | Endpoints |
 |---|---|
-| `/auth` | `POST /login` · `POST /refresh` · `POST /logout` · `GET /me` · `POST /change-password` |
+| `/auth` | `POST /signup` · `POST /login` · `POST /refresh` · `POST /logout` · `GET /me` · `POST /change-password` |
 | `/attendance` | `GET /today` · `POST /punch-in` · `POST /punch-out` · `GET /log` · `GET /summary` · `GET /calendar` · `GET,POST /regularizations` |
 | `/leave` | `GET /types` · `GET /balances` · `GET,POST /requests` · `POST /requests/:id/cancel` |
 | `/payroll` | `GET /payslips` · `GET /payslips/:id` · `GET /ytd` |
