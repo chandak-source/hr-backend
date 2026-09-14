@@ -43,12 +43,6 @@ export const daysBetweenInclusive = (from, to) => {
   return Math.round((b - a) / 86400000) + 1;
 };
 
-export const minutesBetween = (start, end) => {
-  const [sh, sm] = start.split(':').map(Number);
-  const [eh, em] = end.split(':').map(Number);
-  return Math.max(0, eh * 60 + em - (sh * 60 + sm));
-};
-
 export const daysInMonth = (month, year) => new Date(year, month, 0).getDate();
 
 /** Indian financial year label for a date, e.g. "2026-2027". */

@@ -6,9 +6,12 @@ import { authenticate } from '../middleware/auth.js';
 import { ApiError } from '../utils/ApiError.js';
 import { nextCode } from '../services/sequence.service.js';
 import {
+  evaluateAttendance,
+  policyForEmployee,
+} from '../services/attendance-policy.service.js';
+import {
   asyncHandler,
   created,
-  minutesBetween,
   monthFilter,
   ok,
   parseWith,
@@ -79,10 +82,9 @@ router.post(
       throw ApiError.conflict('You are already punched in');
     }
 
-    const employee = await Employee.findById(req.user._id).populate('shiftId').lean();
-    const shift = employee?.shiftId;
-    const lateBy = shift?.startTime ? minutesBetween(shift.startTime, time) : 0;
-    const status = lateBy > (shift?.graceMinutes ?? 15) ? 'late_in' : 'present';
+    // Graded against the employee's own shift — HR owns every threshold.
+    const policy = await policyForEmployee(req.user._id);
+    const verdict = evaluateAttendance({ policy, punchIn: time, punchOut: null });
 
     await Attendance.updateOne(
       { employeeId: req.user._id, workDate: date },
@@ -91,10 +93,10 @@ router.post(
           punchIn: time,
           punchOut: null,
           totalMinutes: 0,
-          status,
+          status: verdict.status,
           workMode: body.workMode,
           inLocation: body.address ?? null,
-          shiftId: employee?.shiftId?._id ?? null,
+          shiftId: policy.id,
         },
       },
       { upsert: true },
@@ -110,7 +112,15 @@ router.post(
       address: body.address ?? null,
     });
 
-    created(res, { date, punchIn: time, status, workMode: body.workMode, lateByMinutes: lateBy });
+    created(res, {
+      date,
+      punchIn: time,
+      status: verdict.status,
+      workMode: body.workMode,
+      lateByMinutes: verdict.lateByMinutes,
+      shift: policy.name,
+      reason: verdict.reason,
+    });
   }),
 );
 
@@ -125,12 +135,16 @@ router.post(
     if (!row?.punchIn) throw ApiError.badRequest('Punch in first');
     if (row.punchOut) throw ApiError.conflict('You have already punched out today');
 
-    const minutes = minutesBetween(row.punchIn, time);
-    const status = minutes < 240 ? 'half_day' : row.status;
+    // Now that both punches exist the day gets its final grade: how late the
+    // arrival was and how much of the required day was worked, whichever is
+    // worse. Every threshold is HR's, none of them is in this file.
+    const policy = await policyForEmployee(req.user._id);
+    const verdict = evaluateAttendance({ policy, punchIn: row.punchIn, punchOut: time });
+    const minutes = verdict.workedMinutes;
 
     await Attendance.updateOne(
       { _id: row._id },
-      { $set: { punchOut: time, totalMinutes: minutes, status } },
+      { $set: { punchOut: time, totalMinutes: minutes, status: verdict.status } },
     );
     await PunchLog.create({
       employeeId: req.user._id,
@@ -145,7 +159,11 @@ router.post(
       punchOut: time,
       totalMinutes: minutes,
       totalHours: `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`,
-      status,
+      status: verdict.status,
+      lateByMinutes: verdict.lateByMinutes,
+      shortfallMinutes: verdict.shortfallMinutes,
+      lopFactor: verdict.lopFactor,
+      reason: verdict.reason,
     });
   }),
 );
@@ -195,7 +213,11 @@ router.get(
 
     const byStatus = Object.fromEntries(rows.map((r) => [r._id, r.total]));
     const workedMinutes = rows.reduce((s, r) => s + Number(r.minutes), 0);
-    const workedDays = (byStatus.present ?? 0) + (byStatus.late_in ?? 0) + (byStatus.half_day ?? 0);
+    const workedDays =
+      (byStatus.present ?? 0) +
+      (byStatus.late_in ?? 0) +
+      (byStatus.quarter_day ?? 0) +
+      (byStatus.half_day ?? 0);
     const present = (byStatus.present ?? 0) + (byStatus.late_in ?? 0);
     const workingDays =
       Object.values(byStatus).reduce((a, b) => a + b, 0) -
@@ -213,6 +235,7 @@ router.get(
         'Week Off': byStatus.week_off ?? 0,
         Holiday: byStatus.holiday ?? 0,
       },
+      quarterDays: byStatus.quarter_day ?? 0,
       halfDays: byStatus.half_day ?? 0,
       lateIns: byStatus.late_in ?? 0,
       workingDays,

@@ -103,7 +103,8 @@ router.get(
 
     const by = Object.fromEntries(rows.map((r) => [r._id, r.total]));
     const size = rows.reduce((s, r) => s + r.total, 0);
-    const present = (by.present ?? 0) + (by.late_in ?? 0) + (by.half_day ?? 0);
+    const present =
+      (by.present ?? 0) + (by.late_in ?? 0) + (by.quarter_day ?? 0) + (by.half_day ?? 0);
 
     ok(res, {
       date: on,
@@ -137,7 +138,13 @@ router.get(
           _id: '$workDate',
           total: { $sum: 1 },
           present: {
-            $sum: { $cond: [{ $in: ['$status', ['present', 'late_in', 'half_day']] }, 1, 0] },
+            $sum: {
+              $cond: [
+                { $in: ['$status', ['present', 'late_in', 'quarter_day', 'half_day']] },
+                1,
+                0,
+              ],
+            },
           },
         },
       },
@@ -192,6 +199,9 @@ router.get(
           present: { $sum: { $cond: [{ $in: ['$status', ['present', 'late_in']] }, 1, 0] } },
           leaves: { $sum: { $cond: [{ $eq: ['$status', 'leave'] }, 1, 0] } },
           lateMarks: { $sum: { $cond: [{ $eq: ['$status', 'late_in'] }, 1, 0] } },
+          partialDays: {
+            $sum: { $cond: [{ $in: ['$status', ['quarter_day', 'half_day']] }, 1, 0] },
+          },
           absents: { $sum: { $cond: [{ $in: ['$status', ['absent', 'miss_punch']] }, 1, 0] } },
         },
       },
@@ -200,7 +210,7 @@ router.get(
 
     ok(res, {
       ...member,
-      monthToDate: mtd ?? { present: 0, leaves: 0, lateMarks: 0, absents: 0 },
+      monthToDate: mtd ?? { present: 0, leaves: 0, lateMarks: 0, partialDays: 0, absents: 0 },
     });
   }),
 );

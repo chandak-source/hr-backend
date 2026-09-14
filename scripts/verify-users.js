@@ -113,14 +113,26 @@ for (const role of ['employee', 'manager', 'admin']) {
   });
 }
 
-await check('a new employee gets leave balances and attendance', async () => {
+await check('a new employee gets leave balances', async () => {
   const session = await login(created.employee, process.env.SEED_PASSWORD ?? 'demo@1234');
   const balances = await call('GET', '/leave/balances', { token: session.token });
   must(balances.json.data.length > 0, 'no leave balances allocated');
   must(balances.json.data.some((b) => b.shortCode === 'CL'), 'no casual leave');
+});
 
+await check('a new employee gets no attendance it never earned', async () => {
+  const session = await login(created.employee, process.env.SEED_PASSWORD ?? 'demo@1234');
   const log = await call('GET', '/attendance/log', { token: session.token });
-  must(log.json.data.length > 0, 'no attendance backfilled');
+
+  // Provisioning lays out weekends and holidays and nothing else — punch times
+  // come from punching, never from creating the account.
+  const rows = log.json.data;
+  const invented = rows.filter((r) => r.punchIn || r.punchOut);
+  must(invented.length === 0, `${invented.length} fabricated punch row(s)`);
+  must(
+    rows.every((r) => r.status === 'week_off' || r.status === 'holiday'),
+    `unexpected statuses: ${[...new Set(rows.map((r) => r.status))].join(', ')}`,
+  );
 });
 
 console.log('\nself-service signup');

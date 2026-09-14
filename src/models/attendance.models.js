@@ -3,7 +3,8 @@ import mongoose from 'mongoose';
 import { dateField, schemaOptions, timeField } from './base.js';
 
 export const ATTENDANCE_STATUS = [
-  'present', 'absent', 'week_off', 'holiday', 'leave', 'half_day', 'late_in', 'miss_punch',
+  'present', 'absent', 'week_off', 'holiday', 'leave',
+  'quarter_day', 'half_day', 'late_in', 'miss_punch',
 ];
 
 export const WORK_MODES = ['office', 'wfh', 'client_site', 'on_duty'];

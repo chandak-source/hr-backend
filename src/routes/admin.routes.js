@@ -18,6 +18,7 @@ import {
   Payslip,
   RegularizationRequest,
   SalaryStructure,
+  Shift,
 } from '../models/index.js';
 import { authenticate, requireRole } from '../middleware/auth.js';
 import { ApiError } from '../utils/ApiError.js';
@@ -35,13 +36,14 @@ import {
 import { findEmployees, idForEmpCode } from '../services/employee.service.js';
 import { provisionEmployee } from '../services/provisioning.service.js';
 import { computePayslip, countLopDays, MONTH_NAMES } from '../services/payroll.service.js';
+import { LOP_FACTOR, toPolicy, wrappedMinutes } from '../services/attendance-policy.service.js';
 
 const router = Router();
 router.use(authenticate, requireRole('admin'));
 
 const ROLE_LABEL = { admin: 'Admin', manager: 'Manager', employee: 'Employee' };
 
-const WORKED = ['present', 'late_in', 'half_day'];
+const WORKED = ['present', 'late_in', 'quarter_day', 'half_day'];
 const OFF = ['week_off', 'holiday'];
 
 /** Percentage of non-off days that were actually worked, over a date range. */
@@ -302,6 +304,142 @@ router.patch(
 
     const [row] = await findEmployees({ _id: new mongoose.Types.ObjectId(String(req.params.id)) });
     ok(res, row);
+  }),
+);
+
+// ===================================================== attendance policy ====
+//
+// The rules every attendance calculation runs on. They live on the shift, so
+// editing one here changes how punches are graded and how much payroll deducts
+// from the next evaluation onwards — no deploy, no code change.
+
+const withSeconds = (t) => (t && t.length === 5 ? `${t}:00` : t);
+const HHMM = /^\d{2}:\d{2}(:\d{2})?$/;
+const timeRule = (label) => z.string().regex(HHMM, `${label} must be HH:mm`);
+
+const policySchema = z
+  .object({
+    startTime: timeRule('Shift start').optional(),
+    endTime: timeRule('Shift end').optional(),
+    graceMinutes: z.coerce.number().int().min(0).max(240).optional(),
+    quarterDayAfter: timeRule('Quarter-day threshold').nullable().optional(),
+    halfDayAfter: timeRule('Half-day threshold').nullable().optional(),
+    fullDayMinutes: z.coerce.number().int().min(60).max(1440).optional(),
+  })
+  .refine((b) => Object.keys(b).length > 0, { message: 'Nothing to update' });
+
+/** Minutes into the shift a clock time falls, for ordering the thresholds. */
+const intoShift = (startTime, time) => wrappedMinutes(startTime, time);
+
+/**
+ * The thresholds have to escalate: grace, then quarter day, then half day.
+ * Out of order they would be unreachable and HR would never know why the
+ * deduction they configured never fires.
+ */
+function assertThresholdsEscalate(policy) {
+  const { startTime, graceMinutes, quarterDayAfter, halfDayAfter, fullDayMinutes } = policy;
+
+  const quarter = quarterDayAfter ? intoShift(startTime, quarterDayAfter) : null;
+  const half = halfDayAfter ? intoShift(startTime, halfDayAfter) : null;
+
+  if (quarter !== null && quarter <= graceMinutes) {
+    throw ApiError.badRequest(
+      `The quarter-day threshold must be later than the ${graceMinutes}-minute grace period`,
+    );
+  }
+  if (half !== null && quarter !== null && half <= quarter) {
+    throw ApiError.badRequest('The half-day threshold must be later than the quarter-day threshold');
+  }
+  if (half !== null && quarter === null && half <= graceMinutes) {
+    throw ApiError.badRequest(
+      `The half-day threshold must be later than the ${graceMinutes}-minute grace period`,
+    );
+  }
+  if (fullDayMinutes > intoShift(startTime, policy.endTime) && policy.endTime !== startTime) {
+    throw ApiError.badRequest(
+      'A full day cannot require more minutes than the shift itself is long',
+    );
+  }
+}
+
+const asHours = (minutes) =>
+  `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`;
+
+const toMinutesOfDay = (time) => {
+  const [h, m] = time.split(':').map(Number);
+  return h * 60 + m;
+};
+
+/** Adds the derived values the policy screen shows but does not store. */
+function describePolicy(shift, headcount = 0) {
+  const policy = toPolicy(shift);
+  const lateAfterMinutes = (toMinutesOfDay(policy.startTime) + policy.graceMinutes) % 1440;
+
+  return {
+    ...policy,
+    lateAfter: asHours(lateAfterMinutes),
+    shiftMinutes: intoShift(policy.startTime, policy.endTime),
+    fullDayHours: asHours(policy.fullDayMinutes),
+    employees: headcount,
+    // What each resulting status costs, so the screen can state the
+    // consequence next to the rule that triggers it.
+    deduction: {
+      late_in: LOP_FACTOR.late_in,
+      quarter_day: LOP_FACTOR.quarter_day,
+      half_day: LOP_FACTOR.half_day,
+      absent: LOP_FACTOR.absent,
+    },
+  };
+}
+
+// GET /admin/attendance-policy -----------------------------------------------
+router.get(
+  '/attendance-policy',
+  asyncHandler(async (_req, res) => {
+    const shifts = await Shift.find().sort({ startTime: 1 }).lean();
+
+    const counts = await Employee.aggregate([
+      { $match: { status: { $ne: 'exited' }, shiftId: { $ne: null } } },
+      { $group: { _id: '$shiftId', n: { $sum: 1 } } },
+    ]);
+    const headcountBy = new Map(counts.map((c) => [c._id.toString(), c.n]));
+
+    ok(
+      res,
+      shifts.map((s) => describePolicy(s, headcountBy.get(s._id.toString()) ?? 0)),
+      { count: shifts.length },
+    );
+  }),
+);
+
+// PATCH /admin/attendance-policy/:id ------------------------------------------
+router.patch(
+  '/attendance-policy/:id',
+  asyncHandler(async (req, res) => {
+    const body = parseWith(policySchema, req.body ?? {});
+
+    if (!mongoose.isValidObjectId(req.params.id)) throw ApiError.notFound('Shift not found');
+    const current = await Shift.findById(req.params.id).lean();
+    if (!current) throw ApiError.notFound('Shift not found');
+
+    const update = {};
+    for (const key of ['startTime', 'endTime', 'quarterDayAfter', 'halfDayAfter']) {
+      if (key in body) update[key] = body[key] === null ? null : withSeconds(body[key]);
+    }
+    if (body.graceMinutes !== undefined) update.graceMinutes = body.graceMinutes;
+    if (body.fullDayMinutes !== undefined) update.fullDayMinutes = body.fullDayMinutes;
+
+    // Validate the shift as it will be, not just the fields that changed.
+    assertThresholdsEscalate({ ...toPolicy(current), ...update, endTime: update.endTime ?? current.endTime });
+
+    await Shift.updateOne({ _id: current._id }, { $set: update });
+    const saved = await Shift.findById(current._id).lean();
+    const headcount = await Employee.countDocuments({
+      shiftId: current._id,
+      status: { $ne: 'exited' },
+    });
+
+    ok(res, describePolicy(saved, headcount));
   }),
 );
 
@@ -571,6 +709,7 @@ router.get(
               $group: {
                 _id: null,
                 present: { $sum: { $cond: [{ $in: ['$status', ['present', 'late_in']] }, 1, 0] } },
+                quarterDays: { $sum: { $cond: [{ $eq: ['$status', 'quarter_day'] }, 1, 0] } },
                 halfDays: { $sum: { $cond: [{ $eq: ['$status', 'half_day'] }, 1, 0] } },
                 leaves: { $sum: { $cond: [{ $eq: ['$status', 'leave'] }, 1, 0] } },
                 absent: { $sum: { $cond: [{ $in: ['$status', ['absent', 'miss_punch']] }, 1, 0] } },
@@ -590,6 +729,7 @@ router.get(
           name: 1,
           department: { $ifNull: [{ $first: '$dept.name' }, null] },
           present: { $ifNull: ['$a.present', 0] },
+          quarterDays: { $ifNull: ['$a.quarterDays', 0] },
           halfDays: { $ifNull: ['$a.halfDays', 0] },
           leaves: { $ifNull: ['$a.leaves', 0] },
           absent: { $ifNull: ['$a.absent', 0] },

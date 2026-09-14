@@ -20,7 +20,7 @@ import {
 } from '../utils/helpers.js';
 import { nextSequence } from './sequence.service.js';
 
-/** How much attendance history a freshly created employee starts with. */
+/** How far back a freshly created employee's calendar is laid out. */
 const BACKFILL_DAYS = 30;
 
 /**
@@ -69,7 +69,7 @@ export function salarySplit(annualCtc) {
 /**
  * Creates an employee of any role along with everything the app needs for that
  * account to work: salary structure, leave balances for the current financial
- * year, and a short attendance history so the dashboards aren't blank.
+ * year, and the weekend/holiday layout of their calendar.
  *
  * Used by both `POST /admin/employees` and the seeder's bootstrap admin, so
  * there is exactly one way an account comes into existence.
@@ -131,7 +131,7 @@ export async function provisionEmployee(
   );
 
   await allocateLeaveBalances(employee._id, session);
-  await backfillAttendance(employee._id, dateOfJoining, session);
+  await markNonWorkingDays(employee._id, dateOfJoining, session);
 
   return employee;
 }
@@ -162,11 +162,16 @@ export async function allocateLeaveBalances(employeeId, session = null) {
 }
 
 /**
- * Marks the last 30 days (never before the joining date) so the calendar,
- * monthly summary and team roster have something to show on day one.
- * Weekends and holidays are respected; working days are recorded as present.
+ * Marks the weekends and holidays in the account's first month of calendar, so
+ * the attendance calendar knows which days were never working days.
+ *
+ * It deliberately records no punch times. Attendance comes from the employee
+ * actually punching in and out (or from an approved regularization) — inventing
+ * times here would put hours nobody worked into the summary, the team roster
+ * and, through the LOP count, their salary. Working days with no punch simply
+ * have no row until one is created for real.
  */
-export async function backfillAttendance(employeeId, dateOfJoining, session = null) {
+export async function markNonWorkingDays(employeeId, dateOfJoining, session = null) {
   const from = dateOfJoining > daysAgoString(BACKFILL_DAYS)
     ? dateOfJoining
     : daysAgoString(BACKFILL_DAYS);
@@ -179,23 +184,13 @@ export async function backfillAttendance(employeeId, dateOfJoining, session = nu
     .lean();
   const holidaySet = new Set(holidays.map((h) => h.holidayDate));
 
-  const rows = eachDate(from, to).map((workDate) => {
-    if (isWeekOff(workDate)) {
-      return { employeeId, workDate, status: 'week_off' };
-    }
-    if (holidaySet.has(workDate)) {
-      return { employeeId, workDate, status: 'holiday' };
-    }
-    return {
-      employeeId,
-      workDate,
-      punchIn: '09:30:00',
-      punchOut: '18:30:00',
-      totalMinutes: 540,
-      status: 'present',
-      workMode: 'office',
-    };
-  });
+  const rows = eachDate(from, to)
+    .map((workDate) => {
+      if (isWeekOff(workDate)) return { employeeId, workDate, status: 'week_off' };
+      if (holidaySet.has(workDate)) return { employeeId, workDate, status: 'holiday' };
+      return null;
+    })
+    .filter(Boolean);
 
   if (rows.length) await Attendance.insertMany(rows, { session });
   return rows.length;

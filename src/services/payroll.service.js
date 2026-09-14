@@ -1,4 +1,5 @@
 import { Attendance } from '../models/index.js';
+import { DEDUCTIBLE_STATUSES, lopExpression } from './attendance-policy.service.js';
 import { daysInMonth, monthFilter, round2 } from '../utils/helpers.js';
 
 /**
@@ -71,25 +72,27 @@ function estimateMonthlyTds(monthlyGross) {
   return (tax * 1.04) / 12; // + 4% cess
 }
 
-/** LOP days for a month straight from the attendance collection. */
+/**
+ * LOP days for a month, straight from the attendance collection.
+ *
+ * The deduction follows whatever status the attendance policy assigned to each
+ * day — a day is a quarter, a half or a whole loss because of the thresholds HR
+ * configured on the shift, never because of a rule written here. Change the
+ * policy and the next payroll run deducts differently.
+ */
 export async function countLopDays(employeeId, month, year, session = null) {
   const pipeline = [
     {
       $match: {
         employeeId,
         workDate: monthFilter(month, year),
-        status: { $in: ['absent', 'miss_punch', 'half_day'] },
+        status: { $in: DEDUCTIBLE_STATUSES },
       },
     },
-    {
-      $group: {
-        _id: null,
-        lop: { $sum: { $cond: [{ $eq: ['$status', 'half_day'] }, 0.5, 1] } },
-      },
-    },
+    { $group: { _id: null, lop: { $sum: lopExpression('$status') } } },
   ];
   const [row] = await Attendance.aggregate(pipeline).session(session);
-  return Number(row?.lop ?? 0);
+  return round2(Number(row?.lop ?? 0));
 }
 
 export const MONTH_NAMES = [

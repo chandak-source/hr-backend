@@ -47,9 +47,47 @@ validation message. The check is `endsWith`, so `x@superaip.com.evil.com` fails
 too. New accounts get the password in `SEED_PASSWORD` and should change it.
 
 Creating a user also provisions what its modules need: a salary structure,
-leave balances for the current financial year, and 30 days of attendance
-history so the dashboards aren't blank. All of it lives in one place —
-`src/services/provisioning.service.js` — used by both the API and the seeder.
+leave balances for the current financial year, and the weekend/holiday layout
+of their calendar. It records **no punch times** — attendance comes from the
+employee actually punching, never from provisioning. All of it lives in one
+place — `src/services/provisioning.service.js` — used by both the API and the
+seeder.
+
+## Attendance policy
+
+Attendance is graded in exactly one place, `src/services/attendance-policy.service.js`,
+against rules stored on the employee's **shift**. HR edits them from the app
+(Admin → Attendance Policy, `GET`/`PATCH /admin/attendance-policy`); the next
+punch, regularization and payroll run all follow the new values with no deploy.
+
+| Configured on the shift | Meaning |
+|---|---|
+| `startTime`, `endTime` | The shift span. Wrapping past midnight is supported. |
+| `graceMinutes` | Arriving within this of `startTime` is still on time. |
+| `quarterDayAfter` | Arriving after this clock time costs a quarter day. |
+| `halfDayAfter` | Arriving after this clock time costs half a day. |
+| `fullDayMinutes` | Minutes that have to be worked to earn a full day. |
+
+Two checks run on a completed day and **the worse one wins**: how late the
+punch-in was, and how much of `fullDayMinutes` was actually worked. So a
+punctual two-hour day is a half day, and so is a lunchtime arrival that stays
+till midnight.
+
+| Status | Days of pay lost |
+|---|---|
+| `present` | 0 |
+| `late_in` | 0 — a flag, not a deduction |
+| `quarter_day` | 0.25 |
+| `half_day` | 0.5 |
+| `absent`, `miss_punch` | 1 |
+
+Those fractions are what the words mean, not configuration; what HR configures
+is the thresholds that decide which status a day gets. Payroll reads the same
+table (`countLopDays` uses the policy's `lopExpression`), so a deduction can
+never drift from the status the employee sees.
+
+`npm run verify:attendance` asserts all of it, including that changing a
+threshold changes how an identical pair of punch times is graded.
 
 ## Scripts
 
@@ -63,6 +101,7 @@ history so the dashboards aren't blank. All of it lives in one place —
 | `npm run smoke` | Read-only end-to-end check of every route group — safe to re-run |
 | `npm run verify:writes` | Exercises every mutating endpoint. **Not idempotent** — run `npm run db:seed` afterwards |
 | `npm run verify:users` | Checks dynamic user creation, the email domain rule and role enforcement |
+| `npm run verify:attendance` | Grades the policy engine offline, then proves a policy change re-grades the same punch times live. Restores the policy it changed |
 
 ## Environment
 
@@ -110,7 +149,7 @@ except `/auth/signup`, `/auth/login`, `/auth/refresh` and the health endpoints.
 | `/payroll` | `GET /payslips` · `GET /payslips/:id` · `GET /ytd` |
 | `/team` | `GET /members` · `GET /members/:id` · `GET /stats` · `GET /trend` |
 | `/approvals` | `GET /summary` · `GET,POST /leave` · `POST /leave/bulk-approve` · `GET,POST /expenses` · `GET,POST /regularizations` |
-| `/admin` | `GET /overview` · `GET,POST /employees` · `PATCH /employees/:id` · `GET /payroll/runs` · `POST /payroll/run` · `POST /payroll/runs/:id/publish` · `POST /payroll/runs/:id/unlock` · `POST,DELETE /announcements` · `GET /reports/{attendance,leave-balances,payroll-trend}` |
+| `/admin` | `GET /overview` · `GET,POST /employees` · `PATCH /employees/:id` · `GET /attendance-policy` · `PATCH /attendance-policy/:id` · `GET /payroll/runs` · `POST /payroll/run` · `POST /payroll/runs/:id/publish` · `POST /payroll/runs/:id/unlock` · `POST,DELETE /announcements` · `GET /reports/{attendance,leave-balances,payroll-trend}` |
 | root | `GET /expenses` · `POST /expenses` · `GET /expenses/categories` · `GET /tasks` · `PATCH /tasks/:id` · `GET /holidays` · `GET /announcements` · `GET /notifications` · `PATCH /notifications/:id/read` · `POST /notifications/read-all` · `GET /directory` · `GET /departments` |
 | — | `GET /health` readiness (503 if MongoDB is down) · `GET /health/live` liveness — both outside the prefix |
 

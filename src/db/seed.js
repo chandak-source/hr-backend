@@ -52,10 +52,14 @@ const DEPARTMENTS = [
   ['Support', 'SUP'],
 ];
 
+// A shift is also its attendance policy. These are opening values for a fresh
+// database — HR changes them from Admin → Attendance Policy, and every
+// calculation follows from there.
+// [name, start, end, grace, quarter-day after, half-day after, full-day minutes]
 const SHIFTS = [
-  ['General', '09:30:00', '18:30:00', 15, '13:30:00'],
-  ['Early', '07:30:00', '16:30:00', 10, '11:30:00'],
-  ['Night', '21:00:00', '06:00:00', 15, '01:30:00'],
+  ['General', '09:30:00', '18:30:00', 15, '10:30:00', '13:30:00', 540],
+  ['Early', '07:30:00', '16:30:00', 10, '08:30:00', '11:30:00', 540],
+  ['Night', '21:00:00', '06:00:00', 15, '22:00:00', '01:30:00', 540],
 ];
 
 const LOCATIONS = [
@@ -134,9 +138,11 @@ async function seed() {
     DEPARTMENTS.map(([name, code]) => ({ name, code })),
   );
   await Shift.insertMany(
-    SHIFTS.map(([name, startTime, endTime, graceMinutes, halfDayAfter]) => ({
-      name, startTime, endTime, graceMinutes, halfDayAfter,
-    })),
+    SHIFTS.map(
+      ([name, startTime, endTime, graceMinutes, quarterDayAfter, halfDayAfter, fullDayMinutes]) => ({
+        name, startTime, endTime, graceMinutes, quarterDayAfter, halfDayAfter, fullDayMinutes,
+      }),
+    ),
   );
   const locations = await Location.insertMany(
     LOCATIONS.map(([name, address, latitude, longitude, geofenceRadiusM]) => ({

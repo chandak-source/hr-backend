@@ -15,6 +15,10 @@ import {
 } from '../models/index.js';
 import { authenticate, requireRole } from '../middleware/auth.js';
 import { ApiError } from '../utils/ApiError.js';
+import {
+  evaluateAttendance,
+  policyForEmployee,
+} from '../services/attendance-policy.service.js';
 import { asyncHandler, eachDate, financialYearOf, ok, parseWith } from '../utils/helpers.js';
 
 const router = Router();
@@ -383,12 +387,16 @@ router.post(
       );
 
       if (approved) {
-        const minutes =
-          Number(request.punchOut.slice(0, 2)) * 60 +
-          Number(request.punchOut.slice(3, 5)) -
-          (Number(request.punchIn.slice(0, 2)) * 60 + Number(request.punchIn.slice(3, 5)));
-
-        const employee = await Employee.findById(request.employeeId).select('shiftId').lean();
+        // Regularizing supplies the missing punches; it does not hand out a
+        // full day. The corrected times go through the same policy as a live
+        // punch, so a manager approving 11:00–14:00 gets a half day, not
+        // "present".
+        const policy = await policyForEmployee(request.employeeId, session);
+        const verdict = evaluateAttendance({
+          policy,
+          punchIn: request.punchIn,
+          punchOut: request.punchOut,
+        });
 
         await Attendance.updateOne(
           { employeeId: request.employeeId, workDate: request.workDate },
@@ -396,11 +404,11 @@ router.post(
             $set: {
               punchIn: request.punchIn,
               punchOut: request.punchOut,
-              totalMinutes: Math.max(0, minutes),
-              status: 'present',
+              totalMinutes: verdict.workedMinutes,
+              status: verdict.status,
               isRegularized: true,
             },
-            $setOnInsert: { shiftId: employee?.shiftId ?? null },
+            $setOnInsert: { shiftId: policy.id },
           },
           { upsert: true, session },
         );
