@@ -24,7 +24,7 @@ export async function nextSequence(key, session = null) {
   const query = Counter.findByIdAndUpdate(
     key,
     { $inc: { seq: 1 }, $setOnInsert: { _id: key } },
-    { new: true, upsert: true, setDefaultsOnInsert: true },
+    { returnDocument: 'after', upsert: true, setDefaultsOnInsert: true },
   );
   if (session) query.session(session);
   const counter = await query.lean();

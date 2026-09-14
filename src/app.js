@@ -27,7 +27,7 @@ export function createApp() {
 
   app.use(
     `${env.apiPrefix}/auth`,
-    rateLimit({ windowMs: 15 * 60 * 1000, limit: 50, standardHeaders: 'draft-8' }),
+    rateLimit({ windowMs: 15 * 60 * 1000, limit: env.authRateLimit, standardHeaders: 'draft-8' }),
   );
 
   // Hitting the bare host should say what this is, not read as a 404.

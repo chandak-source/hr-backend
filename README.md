@@ -10,17 +10,34 @@ zod validation.
 npm install
 cp .env.example .env        # set MONGODB_URI + a long random JWT_SECRET
 npm run db:migrate          # build indexes
-npm run db:seed             # demo employees, attendance, leave, payroll
+npm run db:seed             # master data + one bootstrap admin
 npm run dev                 # http://localhost:4000/api/v1
 ```
 
-Seeded accounts all use the password from `SEED_PASSWORD` (default `demo@1234`):
+## Accounts
 
-| Role | Email |
-|---|---|
-| Admin | `rupal.mehta@chandacorp.com` |
-| Manager | `nikhil.desai@chandacorp.com` |
-| Employee | `chandan.sharma@chandacorp.com` |
+There are **no demo users**. The seeder creates master data (departments,
+shifts, leave types, holidays…) and exactly one administrator, taken from
+configuration rather than source:
+
+```env
+BOOTSTRAP_ADMIN_EMAIL=admin@superaip.com
+BOOTSTRAP_ADMIN_PASSWORD=<a long random string>
+```
+
+Every other account — Employee, Manager or Admin — is created by signing in as
+that admin and using **Employees → Add** in the app, which posts to
+`POST /admin/employees`.
+
+**Email domain is enforced.** An account may only be created under
+`ALLOWED_EMAIL_DOMAIN` (`@superaip.com`); anything else is refused with a
+validation message. The check is `endsWith`, so `x@superaip.com.evil.com` fails
+too. New accounts get the password in `SEED_PASSWORD` and should change it.
+
+Creating a user also provisions what its modules need: a salary structure,
+leave balances for the current financial year, and 30 days of attendance
+history so the dashboards aren't blank. All of it lives in one place —
+`src/services/provisioning.service.js` — used by both the API and the seeder.
 
 ## Scripts
 
@@ -29,10 +46,11 @@ Seeded accounts all use the password from `SEED_PASSWORD` (default `demo@1234`):
 | `npm start` | Run the API |
 | `npm run dev` | Run with `--watch` |
 | `npm run db:migrate` | Create collections + build indexes (`--fresh` drops the database first) |
-| `npm run db:seed` | Load demo data (clears the collections it writes) |
+| `npm run db:seed` | Master data + the one bootstrap admin (clears the collections it writes) |
 | `npm run db:reset` | `db:migrate --fresh` + `db:seed` |
 | `npm run smoke` | Read-only end-to-end check of every route group — safe to re-run |
 | `npm run verify:writes` | Exercises every mutating endpoint. **Not idempotent** — run `npm run db:seed` afterwards |
+| `npm run verify:users` | Checks dynamic user creation, the email domain rule and role enforcement |
 
 ## Environment
 
@@ -47,7 +65,12 @@ Seeded accounts all use the password from `SEED_PASSWORD` (default `demo@1234`):
 | `JWT_SECRET` | — | **Required.** Long random string |
 | `JWT_EXPIRES_IN` | `1d` | Access token TTL |
 | `REFRESH_TOKEN_EXPIRES_IN_DAYS` | `30` | |
-| `SEED_PASSWORD` | `demo@1234` | Seeder + the default for admin-created employees |
+| `SEED_PASSWORD` | `demo@1234` | Default password for accounts created in the app |
+| `ALLOWED_EMAIL_DOMAIN` | `@superaip.com` | The only domain an account may be created under |
+| `BOOTSTRAP_ADMIN_EMAIL` | — | **Required by the seeder.** The one pre-existing account |
+| `BOOTSTRAP_ADMIN_PASSWORD` | — | **Required by the seeder.** Minimum 8 characters |
+| `BOOTSTRAP_ADMIN_NAME` | `System Administrator` | |
+| `AUTH_RATE_LIMIT` | `50` | Sign-in attempts per IP per 15 minutes |
 
 ### Local DNS
 
@@ -119,12 +142,13 @@ src/
 ├─ app.js             express wiring, helmet/cors/rate-limit, route mounting
 ├─ config/            env.js (validated config), db.js (connection + transactions)
 ├─ models/            mongoose schemas, one file per domain
-├─ db/                migrate.js (indexes), seed.js (demo data)
+├─ db/                migrate.js (indexes), seed.js (masters + bootstrap admin)
 ├─ middleware/        auth.js (JWT + role guards), error.js
 ├─ routes/            one file per module
-├─ services/          employee, payroll and sequence logic shared across routes
+├─ services/          provisioning (the one way an account is made), employee,
+│                     payroll and sequence logic shared across routes
 └─ utils/             ApiError, asyncHandler, date/response helpers
-scripts/              smoke.js, verify-writes.js
+scripts/              _fixtures.js, smoke.js, verify-writes.js, verify-users.js
 ```
 
 ## Docker
@@ -183,7 +207,7 @@ mongodb+srv://<user>:<password>@<cluster>.mongodb.net/hrmh?retryWrites=true&w=ma
 
 ```bash
 npm run db:migrate
-npm run db:seed
+npm run db:seed     # needs BOOTSTRAP_ADMIN_EMAIL / _PASSWORD set
 ```
 
 **3 — Render**

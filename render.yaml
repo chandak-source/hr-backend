@@ -26,6 +26,15 @@ services:
         value: 1d
       - key: REFRESH_TOKEN_EXPIRES_IN_DAYS
         value: "30"
+      # The only domain an account may be created under.
+      - key: ALLOWED_EMAIL_DOMAIN
+        value: "@superaip.com"
+      - key: AUTH_RATE_LIMIT
+        value: "50"
+      # Default password for accounts created through the app's Create User
+      # form. The new user should change it on first sign-in.
+      - key: SEED_PASSWORD
+        sync: false
       # Atlas SRV resolves normally on Render; the local DNS workaround is
       # deliberately left unset here.
       - key: DNS_SERVERS

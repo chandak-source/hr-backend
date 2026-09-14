@@ -35,4 +35,28 @@ export const env = {
   },
 
   seedPassword: required('SEED_PASSWORD', 'demo@1234'),
+
+  /**
+   * Sign-in attempts allowed per IP per 15 minutes. The default protects a
+   * deployed instance; the integration suite signs in on almost every test, so
+   * a dev machine raises it.
+   */
+  authRateLimit: Number(required('AUTH_RATE_LIMIT', 50)),
+
+  /**
+   * The only company domain an account may be created under. Every other
+   * address is rejected at creation time.
+   */
+  allowedEmailDomain: required('ALLOWED_EMAIL_DOMAIN', '@superaip.com').toLowerCase(),
+
+  /**
+   * The single account the seeder creates so somebody can sign in and use the
+   * Create User flow. Supplied as configuration, never hardcoded in source —
+   * there are no other pre-defined users.
+   */
+  bootstrapAdmin: {
+    name: process.env.BOOTSTRAP_ADMIN_NAME ?? 'System Administrator',
+    email: process.env.BOOTSTRAP_ADMIN_EMAIL?.trim().toLowerCase() ?? '',
+    password: process.env.BOOTSTRAP_ADMIN_PASSWORD ?? '',
+  },
 };

@@ -1,4 +1,3 @@
-import bcrypt from 'bcryptjs';
 import { Router } from 'express';
 import mongoose from 'mongoose';
 import { z } from 'zod';
@@ -19,7 +18,6 @@ import {
   Payslip,
   RegularizationRequest,
   SalaryStructure,
-  Shift,
 } from '../models/index.js';
 import { authenticate, requireRole } from '../middleware/auth.js';
 import { ApiError } from '../utils/ApiError.js';
@@ -35,11 +33,13 @@ import {
   todayString,
 } from '../utils/helpers.js';
 import { findEmployees, idForEmpCode } from '../services/employee.service.js';
-import { nextCode } from '../services/sequence.service.js';
+import { provisionEmployee } from '../services/provisioning.service.js';
 import { computePayslip, countLopDays, MONTH_NAMES } from '../services/payroll.service.js';
 
 const router = Router();
 router.use(authenticate, requireRole('admin'));
+
+const ROLE_LABEL = { admin: 'Admin', manager: 'Manager', employee: 'Employee' };
 
 const WORKED = ['present', 'late_in', 'half_day'];
 const OFF = ['week_off', 'holiday'];
@@ -167,7 +167,15 @@ router.get(
 // ============================================================= employees ====
 const createEmployeeSchema = z.object({
   name: z.string().trim().min(3).max(120),
-  email: z.string().trim().toLowerCase().email(),
+  email: z
+    .string()
+    .trim()
+    .toLowerCase()
+    .email('Enter a valid email address')
+    // Accounts may only exist under the company domain.
+    .refine((v) => v.endsWith(env.allowedEmailDomain), {
+      message: `Only ${env.allowedEmailDomain} email addresses are allowed`,
+    }),
   phone: z.string().trim().max(20).optional(),
   role: z.enum(['employee', 'manager', 'admin']).default('employee'),
   designation: z.string().trim().min(2).max(120),
@@ -221,56 +229,34 @@ router.post(
     const location = body.location
       ? await Location.findOne({ name: body.location }).select('_id').lean()
       : null;
-    const generalShift = await Shift.findOne({ name: 'General' }).select('_id').lean();
-
-    const passwordHash = await bcrypt.hash(env.seedPassword, 10);
-
-    const result = await withTransaction(async (session) => {
-      const empCode = await nextCode('EMP', 'employee', session);
-
-      const [employee] = await Employee.create(
-        [
-          {
-            empCode,
-            name: body.name,
-            email: body.email,
-            phone: body.phone ?? null,
-            passwordHash,
-            role: body.role,
-            designation: body.designation,
-            departmentId: dept._id,
-            locationId: location?._id ?? null,
-            shiftId: generalShift?._id ?? null,
-            reportingTo: managerId,
-            dateOfJoining: body.dateOfJoining,
-          },
-        ],
-        { session },
-      );
-
-      const monthly = body.annualCtc / 12;
-      await SalaryStructure.create(
-        [
-          {
-            employeeId: employee._id,
-            effectiveFrom: body.dateOfJoining,
-            annualCtc: body.annualCtc,
-            basic: Math.round(monthly * 0.5),
-            hra: Math.round(monthly * 0.2),
-            conveyance: Math.round(monthly * 0.05),
-            specialAllowance: Math.round(monthly * 0.25),
-            isCurrent: true,
-          },
-        ],
-        { session },
-      );
-
-      return { id: employee._id.toString(), empCode };
-    });
+    // One provisioning path for every account, whatever the role: employee,
+    // manager and admin all come through here, and it also allocates leave
+    // balances and a starting attendance history.
+    const employee = await withTransaction((session) =>
+      provisionEmployee(
+        {
+          name: body.name,
+          email: body.email,
+          password: env.seedPassword,
+          role: body.role,
+          designation: body.designation,
+          departmentId: dept._id,
+          locationId: location?._id ?? null,
+          reportingTo: managerId,
+          dateOfJoining: body.dateOfJoining,
+          annualCtc: body.annualCtc,
+          phone: body.phone ?? null,
+        },
+        session,
+      ),
+    );
 
     created(res, {
-      ...result,
-      message: `Employee created with default password "${env.seedPassword}"`,
+      id: employee._id.toString(),
+      empCode: employee.empCode,
+      email: employee.email,
+      role: employee.role,
+      message: `${ROLE_LABEL[employee.role]} created with default password "${env.seedPassword}"`,
     });
   }),
 );
