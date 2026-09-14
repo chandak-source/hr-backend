@@ -2,7 +2,7 @@
   "name": "chanda-hr-server",
   "version": "1.0.0",
   "private": true,
-  "description": "REST API for the Chanda HR (Employee Self Service) Flutter app \u2014 Express + MongoDB",
+  "description": "REST API for the SuperAipHr (Employee Self Service) Flutter app \u2014 Express + MongoDB",
   "type": "module",
   "main": "src/server.js",
   "scripts": {

@@ -1,6 +1,6 @@
 # hr-backend
 
-REST API for **Chanda HR** — the FactoHR-style employee self-service app.
+REST API for **SuperAipHr** — the FactoHR-style employee self-service app.
 Node 20 + Express 5 + **MongoDB** (Mongoose), JWT auth with refresh tokens,
 zod validation.
 

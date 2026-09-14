@@ -7,7 +7,7 @@ const app = createApp();
 // Bind the port first so container health checks pass even while MongoDB is
 // still connecting; `/health` reports the database separately.
 const server = app.listen(env.port, () => {
-  console.log(`Chanda HR API  →  http://localhost:${env.port}${env.apiPrefix}  [${env.nodeEnv}]`);
+  console.log(`SuperAipHr API  →  http://localhost:${env.port}${env.apiPrefix}  [${env.nodeEnv}]`);
 });
 
 try {

@@ -33,7 +33,7 @@ export function createApp() {
   // Hitting the bare host should say what this is, not read as a 404.
   app.get('/', (_req, res) =>
     res.json({
-      service: 'chanda-hr-api',
+      service: 'superaip-hr-api',
       status: 'ok',
       api: env.apiPrefix,
       health: '/health',
